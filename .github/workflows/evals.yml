@@ -37,5 +37,8 @@ jobs:
         if: always() && env.GEMINI_EVAL_API_KEY != ''
         with:
           name: eval-results
-          path: evals/results_*.jsonl
+          path: |
+            evals/results_*.jsonl
+            evals/SCORECARD.md
+            evals/scorecard.json
           if-no-files-found: ignore

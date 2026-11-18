@@ -271,7 +271,7 @@ def main():
     # questions for the next 24 h (the day resets 13:30 IST), so a separate project key is the default.
     key = ai_llm._cfg("GEMINI_EVAL_API_KEY")
     if not key and not args.use_bot_key:
-        print("Set GEMINI_EVAL_API_KEY in config.py (a key from a SEPARATE Google Cloud project),\n"
+        print("Set GEMINI_EVAL_API_KEY in config.py or the environment (a key from a SEPARATE Google Cloud project),\n"
               "or pass --use-bot-key to spend the bot's daily quota.")
         return 2
     if args.writer:
