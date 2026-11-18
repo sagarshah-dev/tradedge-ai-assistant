@@ -1,4 +1,8 @@
-pandas>=2.0          # 1-min bars in the live caches
-requests>=2.31       # Telegram Bot API (ai_chat.py)
-google-genai>=1.0    # Gemini function calling + embeddings (only with an API key)
-pytest>=8.0          # tests
+pandas>=2.0                      # 1-min bars in the live caches
+requests>=2.31                   # Telegram Bot API (ai_chat.py)
+google-genai>=1.0                # Gemini function calling + embeddings (only with an API key)
+langgraph>=1.0                   # the WHY agent (ai_agent.py)
+langgraph-checkpoint-sqlite>=2.0 # the agent's checkpointer: a pending alert offer survives a restart
+lightgbm>=4.0                    # ml_study.py: does a model beat the odds lookup?
+scikit-learn>=1.4                # LGBMClassifier API + the AUC cross-check in tests
+pytest>=8.0                      # tests

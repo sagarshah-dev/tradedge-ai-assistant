@@ -30,7 +30,7 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 # ── limits (validation, not strategy) ─────────────────────────────────────────
 MAX_LIMIT = 20
@@ -101,6 +101,10 @@ class Ctx:
             import oi_engine
             self._breadth = oi_engine.breadth
         return self._breadth()
+
+
+class Rich(str):
+    """Text that is already Telegram HTML (bold first line, no monospace block). Plain str = <pre>."""
 
 
 class ToolError(Exception):
@@ -211,14 +215,26 @@ FIELD_LABEL = {"price": "price", "open": "open", "high": "high", "low": "low", "
                "range_pct": "range", "pace": "PACE", "rvol": "RVOL", "fut_vol5": "fut vol 5m", "vol5": "stock vol 5m",
                "oi": "OI", "iv": "IV", "score": "score"}
 PRICE_FIELDS = {"price", "open", "high", "low", "vwap", "pdc", "pdh", "pdl"}
+# v19: TEXT fields (scanner words). Same condition language, ops is / is_not / contains.
+# "short breaking stocks" = {left: short_state, op: contains, text: BREAKING}.
+TEXT_FIELDS = {
+    "state": "long scanner state (BREAKING, PRIMED, ARMING, SHAKTIMAN...)",
+    "short_state": "short scanner state", "tier": "conviction tier (LOADING, READY, SUPER)",
+    "stage": "watchlist (kanban) stage", "side": "watchlist side (LONG / SHORT)", "sector": "sector name",
+    "prox": "proximity level name (PDH, PDL, ...)", "pace_band": "PACE band name",
+    "oi_type": "OI type last 30 min: long_buildup, short_buildup, short_covering, long_unwinding, neutral"}
+TEXT_OPS = ("is", "is_not", "contains")
+# a stock with no state / not on the watchlist has the EMPTY word, not a missing value
+TEXT_EMPTY_OK = {"state", "short_state", "stage", "side", "prox"}
 EQ_TOL_PCT = 0.05            # "open = high" = within 0.05% (user 06-11): real prices rarely match to the paisa
 _UNIVERSE = {"type": "STRING", "enum": ["all", "watchlist", "setups"],
              "description": "Default all."}
 CONDITIONS = {"type": "ARRAY", "description": "Rule 14. All must hold (AND).", "items": {"type": "OBJECT", "properties": {
-    "left": {"type": "STRING", "enum": list(FIELDS)},
-    "op": {"type": "STRING", "enum": ["=", ">", "<", ">=", "<="]},
+    "left": {"type": "STRING", "enum": list(FIELDS) + list(TEXT_FIELDS)},
+    "op": {"type": "STRING", "enum": ["=", ">", "<", ">=", "<=", "is", "is_not", "contains"]},
     "right": {"type": "STRING", "description": "Another field name (as left), or empty to use value."},
     "value": {"type": "NUMBER"},
+    "text": {"type": "STRING", "description": "Rule 17 (text fields)."},
     "pct": {"type": "NUMBER", "description": "Offset % on right (0.5% below open -> -0.5)."}},
     "required": ["left", "op"]}}
 
@@ -354,6 +370,23 @@ TOOLS = [
      "description": ("TODAY: how advance/decline changed over the last N minutes (improving or "
                      "weakening), sampled every few minutes."),
      "parameters": _obj({"window_min": {"type": "INTEGER", "description": "10-120. Default 30."}})},
+    {"name": "oi_buildup",
+     "description": "TODAY / NOW: stocks by OI TYPE over the last N min (rule 16).",
+     "parameters": _obj({
+         "kind": {"type": "STRING", "enum": ["long_buildup", "short_buildup", "short_covering", "long_unwinding",
+                                             "buildup", "all"]},
+         "window_min": {"type": "INTEGER", "description": "5-120. Default 30."},
+         "fresh": {"type": "BOOLEAN"},
+         "order": _ORDER, "limit": _LIMIT, "sector": _SECTOR}, ["kind"])},
+    {"name": "explain_market",
+     "description": "WHY / WHAT IS DRIVING / STRONGEST WITH REASONS (rule 18): many checks, then an explanation.",
+     "parameters": _obj({
+         "kind": {"type": "STRING", "enum": ["index_move", "sector_move", "strongest_sectors", "rotation",
+                                             "stock_move", "vix", "crude"]},
+         "target": {"type": "STRING", "description": "Index, sector or NSE symbol. Empty = NIFTY 50."},
+         "compare": {"type": "STRING", "description": "Second index ('midcap up but nifty down')."},
+         "direction": {"type": "STRING", "enum": ["up", "down"]},
+         "window_min": {"type": "INTEGER", "description": "'last N min'. Default 30."}}, ["kind"])},
     {"name": "cannot_answer",
      "description": ("Use when no other tool fits: chit-chat, buy/sell advice, targets, predictions, news, "
                      "FII/DII, PCR, anything not in the data. Give a short reason."),
@@ -620,7 +653,8 @@ def validate(ctx, name, args):
             if not x:
                 continue
             key = x.upper().replace("-", " ")
-            if key in INDEX_ALIASES or key in MARKET_INDICES or key.startswith("NIFTY") or "VIX" in key:
+            if key in INDEX_ALIASES or key in MARKET_INDICES or "NIFTY" in key or "VIX" in key \
+                    or "CRUDE" in key or _FUT_SUFFIX.sub("", key) in INDEX_ALIASES:
                 name_ = "IDX:" + resolve_index(ctx, x)
             else:
                 name_ = _symbol(ctx, {"symbol": x})
@@ -658,6 +692,38 @@ def validate(ctx, name, args):
         if len(syms) < 2:
             raise ToolError("Send 2 or 3 stocks to compare, e.g. 'compare TCS and INFY'.")
         return {"symbols": syms[:3]}
+    if name == "oi_buildup":
+        return {"kind": _enum(a, "kind", ["long_buildup", "short_buildup", "short_covering", "long_unwinding",
+                                          "buildup", "all"], "buildup"),
+                "window_min": max(5, _int(a, "window_min", 5, 120, 30)), "fresh_only": _bool(a, "fresh"),
+                "order": _enum(a, "order", ["top", "bottom"], "top"), "limit": lim(), "sector": _sector(ctx, a),
+                "show": []}     # each row already has price, day %, OI, futures price + volume
+    if name == "explain_market":
+        kind = _enum(a, "kind", ["index_move", "sector_move", "strongest_sectors", "rotation", "stock_move",
+                                 "vix", "crude"])
+        tgt = str(a.get("target") or "").strip()
+        if kind == "stock_move":
+            target = _symbol(ctx, {"symbol": tgt})
+        elif kind == "sector_move":
+            if not tgt:
+                raise ToolError("Which sector? e.g. 'why are PSU banks up'.")
+            target = _sector(ctx, {"sector": tgt}) or tgt.upper()
+        elif kind == "vix":
+            target = "INDIA VIX"
+        elif kind == "crude":
+            target = "CRUDEOIL"
+        elif kind == "index_move":
+            target = resolve_index(ctx, tgt or "NIFTY 50")
+            if target == "ANY":
+                target = "NIFTY 50"
+        else:
+            target = None
+        cmp_ = str(a.get("compare") or "").strip()
+        compare = resolve_index(ctx, cmp_) if cmp_ and kind == "index_move" else None
+        d = str(a.get("direction") or "").strip().lower()
+        return {"kind": kind, "target": target, "compare": None if compare in (None, "ANY", target) else compare,
+                "direction": d if d in ("up", "down") else None,
+                "window_min": max(15, _int(a, "window_min", 15, 60, 30))}
     if name == "market_mood":
         return {}
     if name == "breadth_trend":
@@ -841,6 +907,7 @@ def _window_volume(ctx, minutes):
 # RAM only, ~2 h kept; after a restart the window is honestly "not ready yet".
 SAMPLE_KEEP = 130                    # samples per stock ≈ minutes
 SAMPLE_GAP_S = 150                   # a hole longer than this = missed samples (restart / stall)
+ISAMPLE_KEEP = 400                   # indices (~30 of them): the WHOLE session, so "when did it fall" sees 09:15
 _SAMPLES = {}                        # sym -> deque[(epoch, price, vwap, pace)]
 _SAMPLE_META = {"since": None, "last": None, "n": 0}
 _SAMPLE_LOCK = threading.Lock()
@@ -1090,8 +1157,29 @@ def sample_once(ctx, now_epoch=None):
 
 _ISAMPLES = {}                       # index name -> deque[(epoch, price, day_high, day_low, vwap, pct)]
 INDEX_ALIASES = {"VIX": "INDIA VIX", "INDIAVIX": "INDIA VIX", "NIFTY": "NIFTY 50", "NIFTY50": "NIFTY 50",
-                 "BANKNIFTY": "NIFTY BANK", "BANK NIFTY": "NIFTY BANK"}
-MARKET_INDICES = {"NIFTY 50", "INDIA VIX"}           # not sectors: 'any sector' skips them
+                 "BANKNIFTY": "NIFTY BANK", "BANK NIFTY": "NIFTY BANK",
+                 "MIDCAP": "NIFTY MIDCAP 150", "MIDCAP 150": "NIFTY MIDCAP 150", "NIFTY MIDCAP": "NIFTY MIDCAP 150",
+                 "MIDCAP150": "NIFTY MIDCAP 150", "MID SELECT": "NIFTY MIDCAP SELECT",
+                 "MIDCAP SELECT": "NIFTY MIDCAP SELECT", "MIDCPNIFTY": "NIFTY MIDCAP SELECT",
+                 "SMALLCAP": "NIFTY SMALLCAP 250", "SMALLCAP 250": "NIFTY SMALLCAP 250",
+                 "SMLCAP 250": "NIFTY SMALLCAP 250", "NIFTY SMALLCAP": "NIFTY SMALLCAP 250",
+                 "MICROCAP": "NIFTY MICROCAP 250", "MICROCAP 250": "NIFTY MICROCAP 250",
+                 "NIFTY MICROCAP": "NIFTY MICROCAP 250", "NIFTY500": "NIFTY 500",
+                 "CRUDE": "CRUDEOIL", "CRUDE OIL": "CRUDEOIL", "MCX CRUDE": "CRUDEOIL",
+                 "BN": "NIFTY BANK", "FINNIFTY": "NIFTY FIN SERVICE", "NIFTYNXT50": "NIFTY NEXT 50"}
+# v19c: an index answers OI / IV / expiry through ITS FUTURES (the index itself has no OI).
+# Live 11-11: 'nifty oi data' -> "oi — (not for an index)"; 'nifty future oi' -> "Unknown index NIFTY_FUT".
+INDEX_FUT = {"NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY", "NIFTY MIDCAP SELECT": "MIDCPNIFTY",
+             "NIFTY FIN SERVICE": "FINNIFTY", "NIFTY NEXT 50": "NIFTYNXT50"}
+_FUT_SUFFIX = re.compile(r"[\s_]*(FUT|FUTS|FUTURE|FUTURES)$")
+FUT_FIELDS = ("oi", "fut_vol5", "iv")
+# Not in SECTOR_INTEL: ai_extra.py fetches them (NSE allIndices / Kite MCX) and writes here.
+# {name: {"price", "day_high", "day_low", "pct", "open", "pdc", "ts", ...}}
+EXTRA_INDICES = {}
+EXTRA_NAMES = ("NIFTY MIDCAP 150", "NIFTY MIDCAP SELECT", "NIFTY SMALLCAP 250", "NIFTY MICROCAP 250",
+               "NIFTY 500", "CRUDEOIL")
+EXTRA_STALE_S = 10 * 60               # an extra reading older than this is not sampled again
+MARKET_INDICES = {"NIFTY 50", "INDIA VIX"} | set(EXTRA_NAMES)   # not sectors: 'any sector' skips them
 
 
 def _sample_indices(ctx, now):
@@ -1102,6 +1190,10 @@ def _sample_indices(ctx, now):
         return 0
     with lock:
         data = {k: dict(v) for k, v in ((st.SECTOR_INTEL or {}).get("data") or {}).items() if isinstance(v, dict)}
+    for k, v in list(EXTRA_INDICES.items()):          # broader indices + crude (ai_extra.py)
+        if isinstance(v, dict) and now - (v.get("ts") or 0) <= EXTRA_STALE_S and k not in data:
+            data[k] = {"price": v.get("price"), "day_high": v.get("day_high"), "day_low": v.get("day_low"),
+                       "vwap_v": v.get("vwap_v"), "pct": v.get("pct")}
     n = 0
     with _SAMPLE_LOCK:
         for name, v in data.items():
@@ -1110,7 +1202,7 @@ def _sample_indices(ctx, now):
                 continue
             dq = _ISAMPLES.get(name)
             if dq is None:
-                dq = _ISAMPLES[name] = deque(maxlen=SAMPLE_KEEP)
+                dq = _ISAMPLES[name] = deque(maxlen=ISAMPLE_KEEP)
             if dq and dq[-1][1:] == (px, _f(v.get("day_high")), _f(v.get("day_low")), _f(v.get("vwap_v")),
                                      _f(v.get("pct"))):
                 dq.append((now,) + dq[-1][1:])          # same reading: SECTOR_INTEL not refreshed yet
@@ -1148,9 +1240,10 @@ def resolve_index(ctx, name):
     s = str(name or "").strip().upper()
     if s in ("ANY", "ANY SECTOR", "ALL", "SECTOR", "SECTORS", ""):
         return "ANY"
-    s = INDEX_ALIASES.get(s.replace("-", " "), s)
+    s = _FUT_SUFFIX.sub("", s.replace("-", " ").strip())      # 'NIFTY_FUT' / 'bn future' -> the index
+    s = INDEX_ALIASES.get(s, s)
     names = index_names(ctx)
-    if not names or s in names:
+    if not names or s in names or s in EXTRA_NAMES:      # extras are known even before their first fetch
         return s
     if "NIFTY " + s in names:
         return "NIFTY " + s
@@ -1304,6 +1397,23 @@ def index_fields(ctx, name):
         return None
     return {"price": px, "high": hi, "low": lo, "vwap": vw, "pct": pct,
             "range_pct": (hi / lo - 1) * 100.0 if hi and lo else None}
+
+
+def index_above_vwap(ctx, name):
+    """True / False / None: are the index's FUTURES above their own VWAP?
+    The scanner has no real VWAP for an index: index candles carry no volume, so its `vwap_v` is just the
+    last price (or the day's open for the NSE-direct indices) and "price vs vwap_v" says nothing. Seen live
+    11-11: "above VWAP" printed with NIFTY at its day low. For the indices in state.SECTOR_IDX_VWAP_FUT_NAME
+    (NIFTY 50, NIFTY BANK) the scanner compares the futures price with the futures VWAP and stores the
+    result as `above_vwap`. That flag is the only index VWAP fact that can be stated; every other index: None."""
+    if name not in (getattr(ctx.state, "SECTOR_IDX_VWAP_FUT_NAME", None) or {}):
+        return None
+    try:
+        with ctx.state.SECTOR_INTEL_LOCK:
+            flag = (((ctx.state.SECTOR_INTEL or {}).get("data") or {}).get(name) or {}).get("above_vwap")
+    except Exception:
+        return None
+    return None if flag is None else bool(flag)
 
 
 def _day_hilo(ctx):
@@ -1527,6 +1637,175 @@ def _oi_window(ctx, minutes):
             info[s] = (b1["raw"], b0["raw"], _f(b1.get("ltp")), _f(b0.get("ltp")),
                        datetime.fromtimestamp(b0["ts"]))
     return out, info
+
+
+# OI type of a stock over a window, from the futures OI history (OI + futures price).
+# Standard reading of price vs OI, not a strategy:  price ↑ OI ↑ long build-up · price ↓ OI ↑
+# short build-up · price ↑ OI ↓ short covering · price ↓ OI ↓ long unwinding.
+OI_TYPE_MIN_OI = 0.5          # % OI change below this = no real OI move ("neutral")
+OI_TYPE_MIN_PX = 0.1          # % price change below this = price flat ("neutral")
+OI_TYPES = ("long_buildup", "short_buildup", "short_covering", "long_unwinding")
+OI_TYPE_WORDS = {"long_buildup": "long build-up", "short_buildup": "short build-up",
+                 "short_covering": "short covering", "long_unwinding": "long unwinding", "neutral": "neutral"}
+
+
+def _oi_at(h, mark):
+    """Last OI reading at or before `mark` (epoch), if it is not a restart gap away."""
+    base = [x for x in h if x["ts"] <= mark]
+    if base and base[-1]["raw"] > 0 and mark - base[-1]["ts"] <= OI_GAP_S:
+        return base[-1]
+    return None
+
+
+def oi_type_of(oi_pct, px_pct):
+    if oi_pct is None or px_pct is None:
+        return None
+    if abs(oi_pct) < OI_TYPE_MIN_OI or abs(px_pct) < OI_TYPE_MIN_PX:
+        return "neutral"
+    if oi_pct > 0:
+        return "long_buildup" if px_pct > 0 else "short_buildup"
+    return "short_covering" if px_pct > 0 else "long_unwinding"
+
+
+def oi_types(ctx, minutes):
+    """({sym: {type, oi, px, oi_prev, fresh, started}}, skipped).
+    oi / px = % change over the last N min (futures OI and futures price from OI_HISTORY;
+    stock price from the minute samples when the futures price is missing).
+    fresh = the OI move is NEW: in the N min before, OI moved less than a third as much
+    (None when that older window is not in memory). started = time of the OI low (build-up)
+    or high (unwinding / covering) inside the window: when the move began."""
+    st = ctx.state
+    with st.OI_HISTORY_LOCK:
+        hist = {k: list(dq) for k, dq in st.OI_HISTORY.items()}
+    with _SAMPLE_LOCK:
+        smp = {k: list(dq) for k, dq in _SAMPLES.items()}
+    out, skipped = {}, 0
+    for sym, h in hist.items():
+        h = [x for x in h if isinstance(x, dict) and _f(x.get("raw")) and x.get("ts")]
+        if len(h) < 2:
+            continue
+        now = h[-1]
+        b = _oi_at(h, now["ts"] - minutes * 60)
+        if b is None:
+            skipped += 1
+            continue
+        oi = (now["raw"] / b["raw"] - 1) * 100.0
+        p1, p0 = _f(now.get("ltp")), _f(b.get("ltp"))
+        if not (p1 and p0):
+            xs = smp.get(sym) or []
+            a0 = [x for x in xs if x[0] <= b["ts"]]
+            p1, p0 = (xs[-1][1] if xs else None), (a0[-1][1] if a0 else None)
+        px = (p1 / p0 - 1) * 100.0 if p1 and p0 else None
+        t = oi_type_of(oi, px)
+        if t is None:
+            skipped += 1
+            continue
+        b2 = _oi_at(h, b["ts"] - minutes * 60)
+        oi_prev = (b["raw"] / b2["raw"] - 1) * 100.0 if b2 else None
+        fresh = None if oi_prev is None else abs(oi_prev) < max(OI_TYPE_MIN_OI, abs(oi) / 3.0)
+        win = [x for x in h if x["ts"] >= b["ts"]]
+        pivot = (min if oi > 0 else max)(win, key=lambda x: x["raw"])
+        out[sym] = {"type": t, "oi": oi, "px": px, "oi_prev": oi_prev, "fresh": fresh,
+                    "started": datetime.fromtimestamp(pivot["ts"]).strftime("%H:%M")}
+    return out, skipped
+
+
+def is_index_sym(ctx, sym):
+    """Index futures (NIFTY, BANKNIFTY, MIDCPNIFTY...) sit in the F&O list as sector INDEX:
+    they are never counted as 'stocks' (breadth, stock lists, movers)."""
+    return str(_secmap(ctx).get(sym, "")).upper() == "INDEX" or sym in INDEX_FUT.values()
+
+
+def _dte(ctx, fsym):
+    km = getattr(ctx.state, "kite_mgr", None)
+    exp = (getattr(km, "_expiry_map", None) or {}).get(fsym)
+    try:
+        return (datetime.strptime(str(exp)[:10], "%Y-%m-%d").date() -
+                datetime.strptime(ctx.today, "%Y-%m-%d").date()).days
+    except (TypeError, ValueError):
+        return None
+
+
+def index_futures(ctx, name, window=30):
+    """The index's futures card: OI since open, OI type over the window (+fresh, since), ATM IV and its
+    change, skew side, days to expiry. None when the index has no futures or no data at all."""
+    fs = INDEX_FUT.get(name)
+    if not fs:
+        return None
+    st = ctx.state
+    lock = getattr(st, "OI_CACHE_LOCK", None)
+    if lock is not None:
+        with lock:
+            o = dict((st.OI_CACHE or {}).get(fs) or {})
+    else:
+        o = dict((getattr(st, "OI_CACHE", {}) or {}).get(fs) or {})
+    t = oi_types(ctx, window)[0].get(fs)
+    iv = _iv_values(ctx, 0)[0].get(fs)
+    ivd = _iv_values(ctx, window)[0].get(fs)
+    sk = o.get("skew") if isinstance(o.get("skew"), dict) else {}
+    slope = _f((sk or {}).get("slope"))
+    if not o and not t and iv is None:
+        return None
+    return {"index": name, "sym": fs, "oi_open": _oi_pct(o) if o else None, "type": t["type"] if t else None,
+            "oi_w": t["oi"] if t else None, "px_w": t["px"] if t else None, "started": t["started"] if t else None,
+            "fresh": t["fresh"] if t else None, "iv": iv, "iv_chg": ivd, "slope": slope, "dte": _dte(ctx, fs),
+            "window": window}
+
+
+def fut_line(c):
+    """'Fut NIFTY · OI +2.40% since open · last 30 min long build-up since 09:20 (fresh) · ATM IV 13.6 ...'"""
+    if not c:
+        return ""
+    bits = ["Fut %s" % c["sym"]]
+    if c["oi_open"] is not None:
+        bits.append("OI %s since open" % _p(c["oi_open"]))
+    if c["type"]:
+        if c["type"] == "neutral":
+            bits.append("last %d min OI flat" % c["window"])
+        else:
+            bits.append("last %d min %s since %s%s" % (c["window"], OI_TYPE_WORDS[c["type"]], c["started"],
+                                                       " (fresh)" if c["fresh"] else ""))
+            bits.append("in those %d min OI %s, price %s" % (c["window"], _p(c["oi_w"]), _p(c["px_w"])))
+    if c["iv"] is not None:
+        bits.append("ATM IV %.1f%s" % (c["iv"], (" (%+.1f in %d min)" % (c["iv_chg"], c["window"]))
+                                       if c["iv_chg"] is not None else ""))
+    if c["slope"] is not None and abs(c["slope"]) >= 0.05:
+        bits.append("puts dearer" if c["slope"] > 0 else "calls dearer")
+    if c["dte"] is not None:
+        bits.append("expiry day" if c["dte"] == 0 else "DTE %d" % c["dte"])
+    return " · ".join(bits)
+
+
+def oi_buildup(ctx, kind, window_min, fresh_only, order, limit, sector, show):
+    types, skipped = oi_types(ctx, window_min)
+    if not types:
+        raise ToolError("No OI history for the last %d min yet (OI is read every ~3 min; after a restart "
+                        "it needs %d min)." % (window_min, window_min))
+    res = _live_results(ctx, required=False)
+    counts = {k: 0 for k in OI_TYPES + ("neutral",)}
+    types = {s: x for s, x in types.items() if not is_index_sym(ctx, s)}     # stocks only (indices: ask 'nifty oi')
+    for sym, x in types.items():
+        if _keep(ctx, sym, sector):
+            counts[x["type"]] += 1
+    want = {"buildup": {"long_buildup", "short_buildup"}, "all": set(OI_TYPES)}.get(kind, {kind})
+    rows = [(sym, x) for sym, x in types.items() if x["type"] in want and _keep(ctx, sym, sector)
+            and (not fresh_only or x["fresh"])]
+    rows = _scope(ctx, rows, lambda r: r[0])
+    rows.sort(key=lambda r: abs(r[1]["oi"]), reverse=(order == "top"))
+    n = len(rows)
+    rows = rows[:limit]
+    syms = [r[0] for r in rows]
+    fv = _fut_volume(ctx, min(window_min, LIVE_METRICS["fut_volume"]["max_w"]))[0]
+    if not rows:
+        raise ToolError("No %s%s in the last %d min%s right now. Counts: %s." % (
+            "fresh " if fresh_only else "", OI_TYPE_WORDS.get(kind, kind.replace("_", " ")), window_min,
+            (" in " + _short(sector)) if sector else "",
+            ", ".join("%s %d" % (OI_TYPE_WORDS[k], v) for k, v in counts.items() if k != "neutral")))
+    return {"tool": "oi_buildup", "kind": kind, "window_min": window_min, "fresh_only": fresh_only,
+            "order": order, "sector": sector, "n": n, "counts": counts, "skipped": skipped,
+            "rows": [{"sym": sym, **x, "price": _f((res.get(sym) or {}).get("price")),
+                      "pct": _f((res.get(sym) or {}).get("intra_pct")), "fut": fv.get(sym)} for sym, x in rows],
+            "show": show, "extra": _live_cols(ctx, syms, show, res), "as_of": _as_of(ctx)}
 
 
 def _score_num(r):
@@ -2901,6 +3180,19 @@ def clean_conditions(raw):
         right = str(c.get("right") or "").lower() or None
         if op == "==":
             op = "="
+        if left in TEXT_FIELDS:
+            op = {"=": "is", "!=": "is_not", "<>": "is_not", "not": "is_not", "has": "contains",
+                  "like": "contains", "isnot": "is_not", "is not": "is_not"}.get(op.lower(), op.lower())
+            word = str(c.get("text") or c.get("right") or c.get("value") or "").strip()
+            if op not in TEXT_OPS:
+                raise ToolError("'%s' takes is / is_not / contains, not '%s'" % (left, op))
+            if not word:
+                raise ToolError("'%s %s ?' — which word?" % (left, op))
+            out.append({"left": left, "op": op, "right": None, "value": None, "pct": 0.0,
+                        "text": _norm_word(word)})
+            continue
+        if op in TEXT_OPS:
+            raise ToolError("'%s' is a number: use = > < >= <=" % left)
         if left not in FIELDS or (right and right not in FIELDS):
             raise ToolError("Can't watch '%s' — I know: %s" % (right if left in FIELDS else left, ", ".join(FIELDS)))
         if op not in ("=", ">", "<", ">=", "<="):
@@ -2910,8 +3202,74 @@ def clean_conditions(raw):
             raise ToolError("'%s %s ?' — compare with a field or a number." % (left, op))
         out.append({"left": left, "op": op, "right": right, "value": None if right else val,
                     "pct": _f(c.get("pct")) or 0.0})
+    if not out:
+        raise ToolError("No condition given.")
     if len(out) > 6:
         raise ToolError("Max 6 conditions in one question / alert.")
+    return out
+
+
+def _norm_word(w):
+    """'short_breaking' / 'Short-Breaking' / ' short  breaking ' -> 'SHORT BREAKING'."""
+    return re.sub(r"\s+", " ", re.sub(r"[_\-]+", " ", str(w or ""))).strip().upper()
+
+
+def _text_fields(ctx, need, syms, res):
+    """{sym: {text field: WORD}} for the text fields in `need` (only those asked)."""
+    need = set(need) & set(TEXT_FIELDS)
+    if not need:
+        return {}
+    st = ctx.state
+    shorts = _live_results(ctx, "SHORT", required=False) if "short_state" in need else {}
+    kb = {}
+    if need & {"stage", "side"}:
+        try:
+            with st.KANBAN_LOCK:
+                kb = {k.get("symbol"): dict(k) for k in st.KANBAN if isinstance(k, dict) and k.get("symbol")}
+            with st.WATCH_LOCK:
+                for n in set(st.WATCHLIST) - set(kb):
+                    kb[n] = {"symbol": n, "stage": "watch", "direction": "LONG"}
+        except Exception:
+            kb = {}
+    pace = _live_pace(ctx) if "pace_band" in need else {}
+    oit = oi_types(ctx, 30)[0] if "oi_type" in need else {}
+    conv = None
+    if "tier" in need:
+        try:
+            conv = ctx.conviction("LONG")
+        except Exception:
+            conv = None
+    out = {}
+    for s in syms:
+        r, f = res.get(s) or {}, {}
+        if "state" in need:
+            f["state"] = _norm_word(r.get("state"))
+        if "short_state" in need:
+            f["short_state"] = _norm_word((shorts.get(s) or {}).get("state"))
+        if "stage" in need:
+            f["stage"] = _norm_word((kb.get(s) or {}).get("stage"))
+        if "side" in need:
+            f["side"] = _norm_word((kb.get(s) or {}).get("direction")) if s in kb else ""
+        if "sector" in need:
+            f["sector"] = _norm_word(r.get("sector") or _secmap(ctx).get(s, "")) or None
+        if "prox" in need:
+            f["prox"] = _norm_word(r.get("prox_name"))
+        if "pace_band" in need:
+            b = ctx.pband(pace.get(s)) if pace.get(s) is not None else None
+            f["pace_band"] = _norm_word(b) if b else None
+        if "oi_type" in need:
+            t = oit.get(s)
+            f["oi_type"] = _norm_word(t["type"]) if t else None
+        if "tier" in need:
+            tier = None
+            if conv is not None and r:
+                try:
+                    tier = conv(s, _f(r.get("rvol")) or 1.0, _f(r.get("intra_pct")) or 0.0,
+                                r.get("sector") or _secmap(ctx).get(s, ""))[1]
+                except Exception:
+                    tier = None
+            f["tier"] = _norm_word(tier) if tier else None
+        out[s] = f
     return out
 
 
@@ -2948,11 +3306,24 @@ def stock_fields(ctx, need, only=None):
             o = oi.get(s)
             f["oi"] = _oi_pct(o) if isinstance(o, dict) else None
         out[s] = f
+    if set(need) & set(TEXT_FIELDS):
+        for s, tf in _text_fields(ctx, need, list(out), res).items():
+            out[s].update(tf)
     return out
 
 
 def cond_holds(f, c):
     """True / False, or None when a needed value is missing (the stock is skipped, not failed)."""
+    if c["left"] in TEXT_FIELDS:
+        w = f.get(c["left"])
+        if w is None:
+            if c["left"] not in TEXT_EMPTY_OK:
+                return None
+            w = ""
+        t = c.get("text") or ""
+        if c["op"] == "contains":
+            return t in w
+        return (w == t) if c["op"] == "is" else (w != t)
     L = f.get(c["left"])
     R = f.get(c["right"]) if c["right"] else c["value"]
     if L is None or R is None:
@@ -2979,6 +3350,8 @@ def _cv(field, v):
 
 
 def cond_words(c):
+    if c["left"] in TEXT_FIELDS:
+        return "%s %s %s" % (c["left"], {"is": "is", "is_not": "is not", "contains": "has"}[c["op"]], c["text"])
     r = c["right"] or ("%g" % c["value"])
     if c["right"] and c.get("pct"):
         r = "%s %s%g%%" % (c["right"], "+" if c["pct"] > 0 else "−", abs(c["pct"]))
@@ -2988,6 +3361,8 @@ def cond_words(c):
 
 def cond_values(f, c):
     """'open 152.40 = high 152.40' with the live numbers, for the reply."""
+    if c["left"] in TEXT_FIELDS:
+        return "%s %s" % (c["left"], f.get(c["left"]) or "—")
     op = {"=": "=", ">": ">", "<": "<", ">=": "≥", "<=": "≤"}[c["op"]]
     R = f.get(c["right"]) if c["right"] else c["value"]
     rr = c["right"] or ""
@@ -3027,8 +3402,16 @@ def live_value(ctx, symbols, fields):
             if f is None:
                 rows.append({"sym": name, "missing": "no live index data yet"})
                 continue
+            fut = index_futures(ctx, name)
+            if fut:
+                f = dict(f)
+                f["oi"], f["iv"] = fut["oi_open"], fut["iv"]
+                if "fut_vol5" in fields:
+                    f["fut_vol5"] = (stock_fields(ctx, {"fut_vol5"}, only={fut["sym"]}).get(fut["sym"]) or {}).get(
+                        "fut_vol5")
             bad = [x for x in fields if x not in f]
-            rows.append({"sym": name, "f": f, "times": {}, "na": bad, "index": True})
+            rows.append({"sym": name, "f": f, "times": {}, "na": bad, "index": True, "fut": fut,
+                         "fut_asked": bool(fut) and bool(set(fields) & set(FUT_FIELDS))})
             continue
         f = f_all.get(s)
         if f is None:
@@ -3050,9 +3433,15 @@ def live_screen(ctx, conditions, order_by, order, limit, sector, show):
     hit.sort(key=key)
     n = len(hit)
     if not hit:
-        raise ToolError("No stock matches %s right now%s%s." % (" and ".join(cond_words(c) for c in conditions),
-                                                               (" in " + _short(sector)) if sector else "",
-                                                               _scope_hint(ctx)))
+        hint = ""
+        for c in conditions:
+            if c["left"] in TEXT_FIELDS:
+                seen = sorted({f.get(c["left"]) for f in stock_fields(ctx, {c["left"]}).values()
+                               if f.get(c["left"])})
+                hint += "\n%s right now: %s" % (c["left"], ", ".join(seen[:12]) or "none")
+        raise ToolError("No stock matches %s right now%s%s.%s" % (" and ".join(cond_words(c) for c in conditions),
+                                                                 (" in " + _short(sector)) if sector else "",
+                                                                 _scope_hint(ctx), hint))
     hit = hit[:limit]
     show = [c for c in show if c not in ("price", "pct")]
     syms = [s for s, _ in hit]
@@ -3072,7 +3461,8 @@ _IMPL = {"top_symbols": top_symbols, "level_breaks_history": level_breaks_histor
          "current_candidates": current_candidates, "watchlist_status": watchlist_status,
          "recent_alerts": recent_alerts, "live_sector_rank": live_sector_rank,
          "market_mood": market_mood, "breadth_trend": breadth_trend, "cannot_answer": cannot_answer,
-         "compare_symbols": compare_symbols, "live_screen": live_screen, "live_value": live_value}
+         "compare_symbols": compare_symbols, "live_screen": live_screen, "live_value": live_value,
+         "oi_buildup": oi_buildup, "explain_market": lambda ctx, **k: __import__("ai_evidence").explain(ctx, **k)}
 assert set(_IMPL) == TOOL_NAMES
 
 
@@ -3156,10 +3546,39 @@ def _cols_in_text(text):
     return out
 
 
+_SECTOR_FILLER = {"sector", "sectors", "today", "now", "right", "how", "is", "the", "what", "about", "show", "me",
+                  "doing", "status", "update", "view", "nifty", "index", "stocks", "stock", "aaje", "kem", "che", "su",
+                  "kya", "hai", "batao", "live", "in", "of", "and", "s"}
+_RANK_W = re.compile(r"\b(top|best|worst|rank\w*|all|compare|vs|versus|list|which|strongest|weakest|gainers?|"
+                     r"losers?|why|kem|kyu|alert)\b", re.I)
+
+
+def _lone_sector(ctx, text):
+    """'fmcg sector' / 'how is pharma today' -> 'NIFTY FMCG'. None when the text is anything more."""
+    t = str(text or "").lower()
+    if _RANK_W.search(t) or re.search(r"\d", t):
+        return None
+    words = [w for w in re.findall(r"[a-z&]+", t) if w not in _SECTOR_FILLER]
+    if not words or len(words) > 3:
+        return None
+    try:
+        sec = _sector(ctx, {"sector": " ".join(words)})
+    except ToolError:
+        return None
+    return sec if sec and str(sec).upper() not in {"INDEX"} | MARKET_INDICES else None
+
+
 def fix_route(ctx, text, name, args, prev=None):
     """(name, args, fixes). Never raises: a fix that cannot apply is skipped."""
     args, fixes = dict(args or {}), []
     try:
+        # 0. just a sector's name ('fmcg sector', live 11-11 gave all 14 sectors) -> that sector's card
+        # (not live_top: 'and in IT?' after a list is a follow-up that keeps the list)
+        if name in ("live_sector_rank", "sector_history", "market_mood", "cannot_answer") \
+                and not args.get("days") and not re.match(r"\s*(and|from|of these|only)\b", text or "", re.I):
+            sec = _lone_sector(ctx, text)
+            if sec:
+                return "explain_market", {"kind": "sector_move", "target": sec}, ["one sector named -> sector card"]
         # 1. today never means history (model sent 'gainers today by ...' to days=1)
         if name in ("top_symbols", "level_breaks_history") and _TODAY.search(text or "") \
                 and not _PAST.search(text or "") and not args.get("end_day") and not args.get("day") \
@@ -3887,8 +4306,11 @@ def _format(r):
             f, bits = x["f"], []
             for fld in r["fields"]:
                 if fld in x["na"]:
-                    bits.append("%s — (not for an index)" % fld)
+                    bits.append("%s — (no futures data for this index)" % fld if fld in FUT_FIELDS
+                                else "%s — (not for an index)" % fld)
                     continue
+                if x.get("fut_asked") and fld in FUT_FIELDS:
+                    continue                                   # shown on the futures line below
                 v = f.get(fld)
                 tm = x["times"].get(fld)
                 bits.append("%s %s%s" % (FIELD_LABEL.get(fld, fld), _cv(fld, v) if v is not None else "— (not available)",
@@ -3899,7 +4321,34 @@ def _format(r):
             if "pct" not in r["fields"]:
                 tail.append("day %s" % _p(f.get("pct")))
             out.append("%s  %s" % (x["sym"], " · ".join(bits + tail)))
+            if x.get("fut_asked") or (x.get("fut") and x["fut"].get("dte") == 0):
+                out.append("  " + fut_line(x["fut"]))
         return "\n".join(out) + _asof(r)
+    if t == "explain_market":
+        return __import__("ai_evidence").render(r)
+    if t == "oi_buildup":
+        w = r["window_min"]
+        lab = OI_TYPE_WORDS.get(r["kind"], {"buildup": "OI build-up (long + short)", "all": "OI moves"}.get(r["kind"]))
+        title = "%d %s%s · last %d min%s" % (len(r["rows"]), "fresh " if r["fresh_only"] else "", lab, w, _sec(r))
+        items = []
+        for i, x in enumerate(r["rows"]):
+            main = "%s  day %s" % (_px2(x["price"]), _p(x["pct"]))
+            bits = ["OI %s since %s" % (_p(x["oi"]), x["started"]), "fut px %s" % _p(x["px"])]
+            if r["kind"] in ("buildup", "all"):
+                bits.insert(0, OI_TYPE_WORDS[x["type"]])
+            if x.get("fut") is not None:
+                bits.append("fut vol %s" % _x(x["fut"]))
+            if x["fresh"] is not None:
+                bits.append("fresh" if x["fresh"] else "OI prev %d min %s" % (w, _p(x["oi_prev"])))
+            items.append((i + 1, x["sym"], main, _extras_line(r, x["sym"]).strip(), " · ".join(bits)))
+        c = r["counts"]
+        tail = "\nAll F&O%s, last %d min: %s" % (_sec(r), w, " · ".join(
+            "%s %d" % (OI_TYPE_WORDS[k], c[k]) for k in OI_TYPES))
+        tail += "\nType = futures price vs OI change (OI ≥ %g%%, price ≥ %g%%); fresh = OI moved < 1/3 as much " \
+                "in the %d min before." % (OI_TYPE_MIN_OI, OI_TYPE_MIN_PX, w)
+        if r.get("skipped"):
+            tail += "\n%d stocks skipped: not enough OI history (restart / new listing)." % r["skipped"]
+        return _cards(title, items, None, tail=tail) + _asof(r)
     if t == "live_screen":
         conds = r["conditions"]
         title = "%d stock%s · %s%s" % (r["n"], "" if r["n"] == 1 else "s",
@@ -4018,6 +4467,8 @@ CHECK_CALLS = [
     ("current_candidates", {}), ("watchlist_status", {}), ("recent_alerts", {}),
     ("live_screen", {"conditions": [{"left": "open", "op": "=", "right": "high"}]}),
     ("live_value", {"symbols": ["NIFTY"], "fields": ["price", "high", "low"]}),
+    ("oi_buildup", {"kind": "buildup"}), ("explain_market", {"kind": "index_move"}),
+    ("explain_market", {"kind": "strongest_sectors"}),
     ("live_top", {"metric": "fut_volume", "window_min": 15}), ("live_top", {"metric": "pace_cross", "window_min": 15}),
     ("live_top", {"metric": "iv", "window_min": 30}), ("live_top", {"metric": "vwap_up", "window_min": 15}),
     ("live_sector_rank", {"metric": "price", "window_min": 15}), ("live_sector_rank", {"metric": "open"}),
@@ -4116,6 +4567,7 @@ def check_report(ctx, live=True):
     for name, args in CHECK_CALLS:
         if not live and name in ("live_top", "live_vwap", "live_level_breaks", "current_candidates",
                                  "watchlist_status", "recent_alerts", "live_sector_rank", "live_screen", "live_value",
+                                 "oi_buildup", "explain_market",
                                  "market_mood", "breadth_trend"):
             continue
         label = name + ("(%s)" % ",".join("%s=%s" % kv for kv in args.items()) if args else "")
@@ -4147,9 +4599,18 @@ Follow-ups (last 5 answers, 15 min): "and in IT?", "with volume",
 • what is low of nykaa · nykaa high and vwap · pdh of tcs · nifty high · vix now
 • fut vol rise last 15 min in FMCG · PACE crossed band last 5 min
 • IV rising last 30 min · furthest from VWAP · top 5 sectors from open
+• fresh long build-up last 30 min · short covering in bank · OI build-up in metal
+• short breaking stocks · SUPER tier stocks · watchlist stocks in BANK · state has PRIMED and rvol > 2
+• midcap now · microcap 250 vs nifty · crude price
+WHY (checks many things, then explains — never advice):
+• why is nifty down · why are psu banks firing · why midcap up and nifty down · why is SBIN moving
+• which sector is strongest now and why · which sector is picking up in last 30 min · why vix up
+SIGNAL ODDS (your past signals, no AI):
+• odds SBIN — how SBIN's SANKET / SAGA / SHARK signal type did before · odds SAGA LONG · /mlreport
 ALERTS: start with "alert me" or "alert:" (default: today only, once)
 • alert me when nykaa goes below 348 · alert me nifty below 24000
 • alert me when HDFCBANK crosses above VWAP · alert me when stock open=high and down 0.5% from open
+• alert me when any stock enters SHORT BREAKING · alert me when midcap falls 1%
 • alert: any FMCG stock fut vol 3x in 15 min always   (always / forever = every day)
 • alert me when VIX moves 1% in 5 min · any sector makes a new day high
 • alert me when any stock change pace · ... and pace > 1.4
@@ -4157,5 +4618,8 @@ ALERTS: start with "alert me" or "alert:" (default: today only, once)
   also: with rvol (≥ 2) · with stock volume (5-min spike ≥ 2x) · or say your number: fut vol 3x)
 • after any answer: "alert above result" (new names entering it) · "alert these when pace changes"
 • alert 3 make it 1.5% · alert 3 delete · /alerts = list, change, pause, delete
-/check = data health · /help = this list
+MARKET ALERTS (ready-made, fire on a change, max once per 30 min): /watch = switch on / off
+• futures flip (fresh build-up in NIFTY / BANKNIFTY futures) · fade from the day high / bounce from the low
+• breadth turn · sector OI build-up · VIX jump — each ping has a 🧠 Why button
+/check = data health · /stats = usage, speed, tokens, eval score · /help = this list
 I never give buy/sell advice."""

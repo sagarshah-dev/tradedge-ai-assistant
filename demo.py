@@ -6,13 +6,19 @@ demo.py -- talk to the TradEdge AI assistant in your terminal, on a FAKE market.
     python demo.py --offline    no key: replays recorded model outputs from the eval cases
     python demo.py --tour       non-interactive walk-through (offline; used by CI)
 
-It runs the SAME code as the Telegram bot (ai_chat.Bot, ai_alerts.AlertFlow, ai_tools),
-only Telegram is swapped for the console and the market is fake_market (a seeded random
-walk, 24 stocks). Type a question, or start with "alert me" to create an alert.
+It runs the SAME code as the Telegram bot (ai_chat.Bot, ai_alerts.AlertFlow, ai_tools,
+the LangGraph WHY agent, the market watches, odds), only Telegram is swapped for the
+console and the market is fake_market (a seeded random walk, 24 stocks). Type a question,
+or start with "alert me" to create an alert.
+
+Offline, the WHY agent's one-line view (🧠) comes from a stand-in writer that only reuses
+the code's own labels; with GEMINI_API_KEY it is written by Gemini and checked by code.
 
 Commands
     /tick 5    the fake clock moves 5 minutes; saved alerts are checked every minute
     /alerts    your alerts          /help    what you can ask
+    /watch     the 5 market watches  /stats   how the assistant is doing
+    odds SBIN  how did signals like SBIN's latest one do before (code only)
     /try       sample questions     /quit
     1, 2, ...  press the numbered button under the last reply
 """
@@ -30,6 +36,7 @@ import ai_alerts                          # noqa: E402
 import ai_chat                            # noqa: E402
 import ai_llm                             # noqa: E402
 import ai_tools                           # noqa: E402
+import ai_watch                           # noqa: E402
 from fake_market import TODAY, Market     # noqa: E402
 
 CHAT = "demo"
@@ -43,7 +50,25 @@ TRY = ["top gainers today with price and rvol", "what is low of nykaa", "stocks 
 
 TOUR = [("q", "top gainers today with price and rvol"), ("q", "what is low of nykaa"),
         ("q", "stocks where open = high"), ("q", "top gainers last 5 days"), ("q", "should I buy TATAMOTORS"),
-        ("q", "alert me when nykaa goes below 348"), ("btn", 1), ("tick", 8), ("q", "/alerts")]
+        ("q", "alert me when nykaa goes below 348"), ("btn", 1), ("tick", 8), ("q", "/alerts"),
+        ("q", "why are psu banks firing today"), ("q", "which stocks showed fresh OI buildup today"),
+        ("q", "odds SBIN"), ("q", "/watch"), ("q", "/stats")]
+
+
+class StandInWriter:
+    """Offline stand-in for the WHY agent's writer (the one LLM step). It writes ONE line from the
+    pattern labels the CODE already found, so it never adds a number of its own. The real run uses
+    Gemini here; the plan, the parallel checks, the verifier and the alert offer are the same code."""
+    model = "stand-in (offline)"
+
+    def route(self, prompt):
+        labels = ""
+        for line in prompt.splitlines():
+            if line.startswith("LABELS (by code):"):
+                labels = line.split(":", 1)[1].strip()
+        parts = [p.strip() for p in labels.split(",") if p.strip()][:2]
+        text = ("; ".join(parts) + ".") if parts else "The evidence above is mixed."
+        return ai_llm.Route("write_view", {"insight": text[:1].upper() + text[1:]}, self.model, 0)
 
 
 class Console:
@@ -114,6 +139,8 @@ def tick(market, bot, minutes, quiet=False):
         market.step()
         ai_alerts.check_alerts(market.ctx, bot.alerts, lambda chat, text: bot._reply(chat, text),
                                now=market.now.timestamp(), day=TODAY)
+        if bot.watch is not None:              # the five ready-made watches, same as the live sampler
+            ai_watch.check(market.ctx, bot.watch, bot._reply, [CHAT], now=market.now.timestamp())
     if not quiet:
         print("\n⏱  fake clock %s" % market.now.strftime("%H:%M"))
 
@@ -148,9 +175,27 @@ def build(offline, log=None, quiet=False):
     ai_chat.MAX_PER_MIN = 60                  # one local user; the 6/min limit protects the free quota
     tg = Console(log, quiet)
     qr, ar = routers(offline)
-    bot = ai_chat.Bot(market.ctx, qr, tg, [CHAT], os.path.join(work, "logs"),
-                      alerts=ai_alerts.AlertStore(os.path.join(work, "data", "ai_alerts.json")), alert_router=ar)
+    store = ai_alerts.AlertStore(os.path.join(work, "data", "ai_alerts.json"))
+    agent = None
+    try:                                      # the LangGraph WHY agent (pip install langgraph ...)
+        import ai_agent
+        agent = ai_agent.MarketAgent(market.ctx, StandInWriter() if offline else writer(),
+                                     db_dir=os.path.join(work, "data"), alerts=store,
+                                     log_dir=os.path.join(work, "logs", "ai_agent"))
+    except ImportError as e:
+        print("(WHY agent off, facts-only answers: %s)" % e)
+    watch = ai_watch.WatchStore(os.path.join(work, "data", "ai_watch.json"))
+    bot = ai_chat.Bot(market.ctx, qr, tg, [CHAT], os.path.join(work, "logs", "ai_chat"),
+                      alerts=store, alert_router=ar, agent=agent, watch=watch)
     return market, bot, tg
+
+
+def writer():
+    """The real writer, as in ai_chat.start(): Gemini with the agent's one write tool."""
+    import ai_agent
+    sectors = {v.upper() for v in __import__("fake_market").SECTOR_MAP.values()}
+    return ai_llm.GeminiRouter(ai_agent.WRITE_TOOL, sectors, model=ai_llm._cfg("AI_AGENT_MODEL", "gemini-3.5-flash"),
+                               fallback=ai_llm._cfg("AI_MODEL", ai_llm.DEFAULT_MODEL), system=ai_agent.writer_system)
 
 
 def run_tour(steps=TOUR, log=None, quiet=False):

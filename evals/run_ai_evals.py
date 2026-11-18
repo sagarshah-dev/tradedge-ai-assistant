@@ -2,13 +2,18 @@
 """
 Router evals: does Gemini pick the right tool + arguments?  READ-ONLY.
 
-Calls the REAL model once per case in ai_router_cases.jsonl (175 cases), then
-checks the result the same way the bot does (ai_tools.validate). Nothing is
-executed against your data; no Telegram message is sent.
+Calls the REAL model once per case in ai_router_cases.jsonl, then checks the
+result the same way the bot does (ai_tools.validate). Nothing is executed
+against your data; no Telegram message is sent.
 
-Run from the TradEdge folder (needs GEMINI_API_KEY in config.py or env):
-    python evals/run_ai_evals.py
-    python evals/run_ai_evals.py --model gemini-3.5-flash     # compare a model
+Run from the TradEdge folder, AFTER market hours (needs GEMINI_API_KEY in config.py or env):
+    python evals/run_ai_evals.py --use-bot-key              # questions -> tool + arguments
+    python evals/run_ai_evals.py --use-bot-key --writer     # the WHY agent's AI sentence vs the verifier
+    python evals/run_ai_evals.py --use-bot-key --alerts     # alert sentences -> alert rule
+    python evals/run_ai_evals.py --model gemini-3.5-flash   # compare a model
+
+Every full run updates evals/scorecard.json and evals/SCORECARD.md (see scorecard.py for what
+each number means). /stats in Telegram shows the same card next to the live numbers.
 
 Pass = right tool AND every expected argument matches after validation.
 Arguments the case does not list are not checked.
@@ -25,6 +30,11 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import ai_llm      # noqa: E402
 import ai_tools    # noqa: E402
+import scorecard   # noqa: E402  (same folder)
+
+
+def _stamp():
+    return datetime.now().strftime("%d-%m-%Y %H:%M")
 
 
 def _norm(v):
@@ -33,6 +43,9 @@ def _norm(v):
 
 def _cond_key(c):
     c = dict(c or {})
+    if c.get("left") in ai_tools.TEXT_FIELDS:            # v19 text condition: field, op, word
+        op = {"=": "is", "==": "is", "!=": "is_not"}.get(c.get("op"), c.get("op"))
+        return (c.get("left"), op, ai_tools._norm_word(c.get("text") or c.get("right") or c.get("value")))
     return (c.get("left"), {"==": "="}.get(c.get("op"), c.get("op")), c.get("right") or None,
             None if c.get("right") else float(c.get("value") or 0), float(c.get("pct") or 0))
 
@@ -114,7 +127,7 @@ def run_alert_evals(ctx, sectors, key, args):
     ai_examples.EMB_CACHE = os.path.join(HERE, "eval_examples_emb.json")
     cases = [json.loads(l) for l in open(os.path.join(HERE, "alert_cases.jsonl"), encoding="utf-8") if l.strip()]
     cases = [c for c in cases if c["tool"] != "code"]
-    passed = 0
+    passed, recs = 0, []
     for i, c in enumerate(cases, 1):
         bad = None
         body = ai_alerts.CREATE_PREFIX.sub("", c["q"], count=1)
@@ -138,10 +151,110 @@ def run_alert_evals(ctx, sectors, key, args):
         except Exception as e:
             ok, got = False, "error: %s" % e
         passed += ok
+        recs.append({"q": c["q"], "pass": bool(ok), "got": got})
         print("%2d %s %-50s -> %s %s" % (i, "PASS" if ok else "FAIL", c["q"][:50], got, bad or ""))
         time.sleep(args.sleep)
     print("\nalerts | model %s | %d/%d passed (%.0f%%)" % (router.model, passed, len(cases), 100.0 * passed / len(cases)))
+    scorecard.update(HERE, "alerts", scorecard.summarize_alerts(recs, router.model, _stamp()))
+    print("scorecard: %s" % os.path.join(HERE, "SCORECARD.md"))
     return 0 if passed == len(cases) else 1
+
+
+def writer_scenarios(ctx):
+    """[(question, explain_market args)]: every question kind, every sector of the fake market, and
+    'asked the wrong direction'. The market is the seeded fake one, so the evidence is the same on
+    every run and only the model's sentence changes."""
+    import ai_evidence as E
+    out = [("why is nifty down", {"kind": "index_move", "direction": "down"}),
+           ("why is nifty up today", {"kind": "index_move", "direction": "up"}),
+           ("why banknifty falling", {"kind": "index_move", "target": "NIFTY BANK", "direction": "down"}),
+           ("which sector is strongest now and why", {"kind": "strongest_sectors"}),
+           ("weakest sector right now with reasons", {"kind": "strongest_sectors", "direction": "down"}),
+           ("which sector is picking up in the last 30 min", {"kind": "rotation"}),
+           ("why vix up today", {"kind": "vix", "direction": "up"}),
+           ("crude effect on market", {"kind": "crude"})]
+    for sec in E._sector_names(ctx):
+        out.append(("why is %s moving" % E._short(sec).lower(), {"kind": "sector_move", "target": sec}))
+    for sym in ("SBIN", "PNB", "INFY", "WIPRO", "RELIANCE", "TATASTEEL"):
+        out.append(("why is %s moving" % sym, {"kind": "stock_move", "target": sym}))
+    return out
+
+
+def writer_record(ag, ctx, q, a):
+    """Run ONE scenario through the real agent graph and read what happened from its trace."""
+    import ai_agent as AG
+    clean = ai_tools.validate(ctx, "explain_market", a)
+    t0 = time.time()
+    _text, _btn, info = ag.ask("eval", clean, q)
+    trace = info.get("trace") or []
+    writes = [t for t in trace if t.get("node") == "write"]
+    verifs = [t for t in trace if t.get("node") == "verify"]
+    fin = [t for t in trace if t.get("node") == "finalize"]
+    wrote = any("attempt" in t for t in writes)
+    first_errors = list((verifs[0].get("errors") if verifs else None) or [])
+    rec = {"q": q, "kind": a.get("kind"), "target": a.get("target"), "wrote": wrote,
+           "attempts": sum(1 for t in writes if "attempt" in t), "first_ok": bool(wrote and not first_errors),
+           "first_errors": first_errors, "dropped": len((fin[-1].get("dropped") if fin else None) or []),
+           "error": next((t["error"] for t in writes if t.get("error")), None),
+           "ms": int((time.time() - t0) * 1000)}
+    # the safety number: re-check what was actually SENT (the saved final answer), not what was drafted
+    final = (ag.graph.get_state({"configurable": {"thread_id": info["thread"]}}).values or {}).get("final") or {}
+    left = AG.verify(final.get("view"), final, q) if final.get("view") else []
+    rec["shipped_bad"] = any("numbers not in EVIDENCE" in e or "advice words" in e for e in left)
+    rec["insight"] = (final.get("view") or {}).get("insight")
+    return rec
+
+
+def run_writer_evals(key, args, writer=None, market=None):
+    """The WHY agent's one AI sentence against the verifier, on the seeded fake market."""
+    import tempfile
+    import ai_agent as AG
+    work = tempfile.mkdtemp(prefix="weval_")
+    if market is None:
+        sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tests"))
+        from fake_market import Market
+        market = Market(work)
+    ctx = market.ctx
+    if writer is None:
+        sectors = {str(v).upper() for v in market.state.SECTOR_MAP.values() if v}
+        writer = ai_llm.GeminiRouter(AG.WRITE_TOOL, sectors, api_key=key or None, fallback="", system=AG.writer_system,
+                                     model=args.model or ai_llm._cfg("AI_AGENT_MODEL",
+                                                                    ai_llm._cfg("AI_ALERT_MODEL", "gemini-3.5-flash")))
+    ag = AG.MarketAgent(ctx, writer, db_dir=os.path.join(work, "db"), alerts=None, log_dir=os.path.join(work, "logs"))
+    recs = []
+    for i, (q, a) in enumerate(writer_scenarios(ctx), 1):
+        try:
+            rec = writer_record(ag, ctx, q, a)
+        except Exception as e:
+            rec = {"q": q, "kind": a.get("kind"), "wrote": False, "error": "%s: %s" % (type(e).__name__, e)}
+        recs.append(rec)
+        tag = ("NO DRAFT (%s)" % rec.get("error")) if not rec.get("wrote") else "FIRST TRY" if rec["first_ok"] \
+            else "DROPPED" if rec["dropped"] else "AFTER RETRY"
+        print("%2d %-12s %-42s %s" % (i, tag, q[:42], (rec.get("insight") or "")[:70]))
+        time.sleep(args.sleep)
+    card = scorecard.summarize_writer(recs, getattr(writer, "model", "?"), _stamp())
+    out_path = os.path.join(HERE, "writer_%s.jsonl" % datetime.now().strftime("%Y-%m-%d_%H%M"))
+    with open(out_path, "w", encoding="utf-8") as f:
+        for r in recs:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    scorecard.update(HERE, "writer", card)
+    print("\nwriter | model %s | first try %s%% | clean %s%% | dropped %d | sent with an unchecked number %d"
+          % (card["model"], card["first_try_pct"], card["clean_pct"], card["dropped"], card["shipped_bad"]))
+    print("details: %s\nscorecard: %s" % (out_path, os.path.join(HERE, "SCORECARD.md")))
+    return 0 if card["shipped_bad"] == 0 and card["drafts"] else 1
+
+
+def _passes(ctx, c, name, args):
+    """(pass, mismatch) for one tool call against a case and its acceptable alternatives."""
+    r = ai_llm.Route(name, args)
+    bad = None
+    for tool, want in [(c["tool"], c["args"])] + [tuple(a) for a in c.get("alt", [])]:
+        if r.name != tool:
+            continue
+        bad = _check(ctx, r, want)
+        if not bad:
+            return True, None
+    return False, bad
 
 
 def main():
@@ -150,6 +263,7 @@ def main():
     ap.add_argument("--sleep", type=float, default=4.0, help="seconds between calls (free-tier RPM)")
     ap.add_argument("--failed-only", action="store_true", help="re-run only the last run's failures")
     ap.add_argument("--alerts", action="store_true", help="evaluate the ALERT sentences (alert_cases.jsonl)")
+    ap.add_argument("--writer", action="store_true", help="evaluate the WHY agent's AI sentence vs the verifier")
     ap.add_argument("--use-bot-key", action="store_true",
                     help="allow the bot's GEMINI_API_KEY (uses the bot's 500/day free quota)")
     args = ap.parse_args()
@@ -157,9 +271,11 @@ def main():
     # questions for the next 24 h (the day resets 13:30 IST), so a separate project key is the default.
     key = ai_llm._cfg("GEMINI_EVAL_API_KEY")
     if not key and not args.use_bot_key:
-        print("Set GEMINI_EVAL_API_KEY in config.py (a key from a SEPARATE Google Cloud project),\n"
+        print("Set GEMINI_EVAL_API_KEY in config.py or the environment (a key from a SEPARATE Google Cloud project),\n"
               "or pass --use-bot-key to spend the bot's daily quota.")
         return 2
+    if args.writer:
+        return run_writer_evals(key, args)
 
     try:
         import state
@@ -189,13 +305,14 @@ def main():
         if not cases:
             return 0
     out_path = os.path.join(HERE, "results_%s.jsonl" % datetime.now().strftime("%Y-%m-%d_%H%M"))
-    passed, ms, tok = 0, [], []
+    passed, ms, tok, recs = 0, [], [], []
     with open(out_path, "w", encoding="utf-8") as out:
         for i, c in enumerate(cases, 1):
             rec = {"q": c["q"], "want_tool": c["tool"], "want_args": c["args"]}
             try:
                 r = router.route(_prompt(c))
                 rec.update({"model_tool": r.name, "model_args": r.args, "ms": r.ms, "tokens": r.tokens})
+                rec["pass_raw"] = _passes(ctx, c, r.name, r.args)[0]       # the model alone, before code repair
                 r.name, r.args, fixes = ai_tools.fix_route(ctx, c["q"], r.name, r.args, _prev_list(c))
                 rec.update({"tool": r.name, "args": r.args})
                 if fixes:
@@ -204,20 +321,14 @@ def main():
                 if r.tokens:
                     tok.append(r.tokens)
                 # A case may list other acceptable answers: "alt": [[tool, args], ...]
-                ok, bad = False, None
-                for tool, want in [(c["tool"], c["args"])] + [tuple(a) for a in c.get("alt", [])]:
-                    if r.name != tool:
-                        continue
-                    bad = _check(ctx, r, want)
-                    if not bad:
-                        ok = True
-                        break
+                ok, bad = _passes(ctx, c, r.name, r.args)
                 if not ok and bad:
                     rec["mismatch"] = bad
                 rec["pass"] = ok
             except ai_llm.RouterError as e:
                 rec.update({"pass": False, "error": "%s: %s" % (e.kind, e)})
             passed += rec["pass"]
+            recs.append(rec)
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             print("%2d %s %-55s -> %s %s" % (i, "PASS" if rec["pass"] else "FAIL", c["q"][:55],
                                            rec.get("tool", rec.get("error", "")), rec.get("mismatch", "")))
@@ -227,8 +338,18 @@ def main():
           % (router.model, passed, n, 100.0 * passed / n,
              sorted(ms)[len(ms) // 2] if ms else "-", int(sum(tok) / len(tok)) if tok else "-"))
     print("details: %s" % out_path)
+    if not args.failed_only:                       # a partial re-run must not overwrite the full-run numbers
+        card = scorecard.summarize_router(recs, router.model, _stamp())
+        scorecard.update(HERE, "router", card)
+        print("model alone %s%% -> with code repair %s%% (repaired %d, broken %d)\nscorecard: %s"
+              % (card["raw_accuracy"], card["accuracy"], card["repaired"], card["broken"],
+                 os.path.join(HERE, "SCORECARD.md")))
     return 0 if passed == n else 1
 
 
 if __name__ == "__main__":
+    try:                                   # a Windows console (cp1252) cannot print "→" or the model's "₹": never crash on it
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     sys.exit(main())

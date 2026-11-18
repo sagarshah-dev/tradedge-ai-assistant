@@ -25,6 +25,7 @@ ONE_CALL_PER_TOOL = [
     ("live_sector_rank", {"metric": "price"}), ("live_value", {"symbols": ["NYKAA"], "fields": ["low"]}),
     ("live_symbol", {"symbol": "NYKAA"}), ("compare_symbols", {"symbols": ["SBIN", "PNB"]}),
     ("market_mood", {}), ("breadth_trend", {"window_min": 30}), ("cannot_answer", {"reason": "advice"}),
+    ("oi_buildup", {"kind": "buildup"}), ("explain_market", {"kind": "index_move"}),
 ]
 
 

@@ -81,3 +81,6 @@
 {"q": "alert me when sbin goes beneath vwap", "tool": "create_alert", "args": {"target": "stocks", "metric": "vwap_down", "symbols": ["SBIN"]}}
 {"q": "alert me when hdfcbank climbs above vwap", "tool": "create_alert", "args": {"target": "stocks", "metric": "vwap_up", "symbols": ["HDFCBANK"]}}
 {"q": "alert me when any stock sinks to a new day low", "tool": "create_alert", "args": {"target": "stocks", "metric": "new_low", "symbols": []}}
+{"q": "alert me when any stock enters short breaking", "tool": "create_alert", "args": {"target": "stocks", "metric": "screen", "conditions": [{"left": "short_state", "op": "contains", "text": "BREAKING"}]}, "v": 19}
+{"q": "alert me when midcap falls 1%", "tool": "create_alert", "args": {"target": "index", "metric": "pct", "symbols": ["NIFTY MIDCAP 150"], "op": "<=", "value": -1}, "v": 19}
+{"q": "alert me when crude goes above 5600", "tool": "create_alert", "args": {"target": "index", "metric": "price", "symbols": ["CRUDEOIL"], "op": ">=", "value": 5600}, "v": 19}

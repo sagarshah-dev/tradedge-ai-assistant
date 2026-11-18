@@ -20,6 +20,7 @@ import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))                    # TradEdge folder
+sys.path.insert(0, os.environ.get("SAGA_SRC", os.path.dirname(HERE)))
 
 import ai_tools as T                                         # noqa: E402
 import ai_chat as C                                          # noqa: E402
@@ -32,10 +33,15 @@ BANK, IT, PSU = "NIFTY BANK", "NIFTY IT", "NIFTY PSU BANK"
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
+
+def _public_schema():
+    with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fake_market", "schema.sql"),
+              encoding="utf-8") as f:
+        return f.read()
+
 def _saga_db(path):
     c = sqlite3.connect(path)
-    with open(os.path.join(os.path.dirname(HERE), "fake_market", "schema.sql"), encoding="utf-8") as f:
-        c.executescript(f.read())
+    c.executescript(_public_schema())
     # AAA rises 1% a day, BBB falls 2%, CCC flat; plus a half-written TODAY row
     for i, d in enumerate(DAYS + [TODAY]):
         for sym, close, vol, pace, rv in (
@@ -207,7 +213,7 @@ def _all_locks_free(st):
 
 # ── validation ───────────────────────────────────────────────────────────────
 def test_every_tool_has_an_implementation():
-    assert set(T._IMPL) == T.TOOL_NAMES and len(T.TOOLS) == 19
+    assert set(T._IMPL) == T.TOOL_NAMES and len(T.TOOLS) == 21          # v19: + oi_buildup, explain_market
 
 
 def test_validate_enums_bounds_and_defaults(ctx):
@@ -1067,7 +1073,9 @@ def test_schema_is_small(ctx):
     """Every tool's text goes with every question: keep the declarations lean (tokens = cost + latency)."""
     import json as _j
     size = len(_j.dumps(T.TOOLS))
-    assert size < 18500, size          # v16 live_screen (conditions) ≈ +450 tokens; trim before raising
+    # v16 live_screen (conditions) ≈ +450 tokens; v19 oi_buildup + explain_market + text fields ≈ +300
+    # tokens (examples live in prompt rules 16-18, not in the declarations). Trim before raising.
+    assert size < 20000, size
 
 
 def test_slash_commands_never_reach_the_llm(ctx, tmp_path):
@@ -1077,7 +1085,9 @@ def test_slash_commands_never_reach_the_llm(ctx, tmp_path):
     assert b.router.prompts == []
     help_, check, check2, unknown = [t for _, t in b.tg.sent]
     assert "I never give buy/sell advice" in help_
-    assert check.startswith("TradEdge data check") and "TOOLS (dry run)" in check and check2.startswith("TradEdge")
+    # v19: /check answers with a short reason first; the full report is one tap away
+    assert check.startswith("<b>🩺") and "Tools" in check and check2.startswith("<b>🩺")
+    assert isinstance(check, T.Rich)
     assert "Unknown command /foo" in unknown
 
 
@@ -1203,6 +1213,7 @@ LIST_CALLS = {                       # one base question per tool that returns a
     "current_candidates": {}, "watchlist_status": {}, "recent_alerts": {},
     "live_sector_rank": {"metric": "price"},
     "live_screen": {"conditions": [{"left": "price", "op": ">", "value": 0}]},
+    "oi_buildup": {"kind": "all", "window_min": 15},
 }
 NO_ORDER_OK = {"recent_alerts": "newest first is the only useful order"}
 SECTOR_ROWS = {"sector_history", "live_sector_rank"}        # rows ARE sectors: no sector filter
@@ -1233,6 +1244,10 @@ def _sector_ctx(ctx):
         st.SESSION_RESULTS[sym] = {"price": px, "intra_pct": pct, "day_open": op, "rvol": 1.0, "vwap": px}
         st.SECTOR_MAP[sym] = sec
         st.FNO_SYMBOLS.append(sym)
+        # v19 oi_buildup: futures OI + price every 3 min for 60 min; OI and price trend with the day %
+        base = NOW.timestamp()
+        st.OI_HISTORY[sym] = deque([{"ts": base - 60 * m, "raw": 1000.0 * (1 + abs(pct) * (60 - m) / 600.0),
+                                     "ltp": px * (1 + pct * (m - 60) / 6000.0)} for m in range(60, -1, -3)])
     return ctx
 
 
@@ -1431,7 +1446,7 @@ def test_samples_after_restart_say_when_ready(ctx):
 
 
 def test_every_stock_row_has_price_and_day_pct(ctx):
-    """user 05-11: 'any question, if a stock is there, price and % must be there'."""
+    """the user 05-11: 'any question, if a stock is there, price and % must be there'."""
     _engine_data(ctx)
     _feed(ctx, 20, lambda s, k: None, lambda s, k: (100 + 0.1 * (20 - k), 100))
     res = ctx.state.SESSION_RESULTS
@@ -1576,7 +1591,9 @@ def test_check_shows_samples_and_gemini(ctx, tmp_path):
     b = _bot(ctx, tmp_path, {})
     b.router.last_error = ("12:14", "gemini-3.5-flash-lite", "quota_day", "429 ...")
     b.router.dead = {"gemini-2.5-flash-lite"}
-    reply, _ = b.answer("/check", "1")
+    reply, rec = b.answer("/check", "1")
+    assert rec["buttons"] == [[("📊 Details", "chk:full")]] and "Gemini ⚠️" in reply
+    reply, _err = b.check_full()                                        # what the Details button sends
     assert "Live samples   4 taken · since 09:31" in reply
     assert "last error 12:14 · gemini-3.5-flash-lite · quota_day" in reply
     assert "not found (skipped): gemini-2.5-flash-lite" in reply
