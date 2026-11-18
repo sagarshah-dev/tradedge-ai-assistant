@@ -32,6 +32,7 @@ Config (config.py first, then environment):
 import html
 import json
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -92,12 +93,13 @@ class Telegram:
         """True when Telegram accepted every part. buttons = [[(label, callback_data)]] on the last part."""
         markup = {"inline_keyboard": [[{"text": l, "callback_data": c} for l, c in row] for row in buttons]} \
             if buttons else None
+        rich = isinstance(text, ai_tools.Rich)      # short answers: real text, bold headline
         parts, ok = chunks(text), True
         for i, chunk in enumerate(parts):
             mk = markup if i == len(parts) - 1 else None
-            d = self.post(chat_id, "<pre>%s</pre>" % html.escape(chunk, quote=False), "HTML", mk)
+            d = self.post(chat_id, chunk if rich else "<pre>%s</pre>" % html.escape(chunk, quote=False), "HTML", mk)
             if not d.get("ok"):                     # HTML rejected: never lose the answer
-                d = self.post(chat_id, chunk, None, mk)
+                d = self.post(chat_id, re.sub(r"</?[bi]>", "", chunk) if rich else chunk, None, mk)
             ok = ok and bool(d.get("ok"))
         return ok
 
@@ -141,8 +143,10 @@ def router_message(kind):
 class Bot:
     """All logic, no thread. Tests drive handle() / digest() directly with fakes."""
 
-    def __init__(self, ctx, router, tg, allowed, log_dir, alerts=None, alert_router=None):
+    def __init__(self, ctx, router, tg, allowed, log_dir, alerts=None, alert_router=None, agent=None, watch=None):
         self.ctx, self.router, self.tg = ctx, router, tg
+        self.agent = agent                             # ai_agent.MarketAgent (WHY questions) or None
+        self.watch = watch                             # ai_watch.WatchStore (ready-made market alerts) or None
         self.alerts = alerts                           # ai_alerts.AlertStore or None
         self.flow = None
         if alerts is not None and alert_router is not None:
@@ -181,6 +185,22 @@ class Bot:
         """Question -> (reply, log record). Never raises."""
         rec = {"ts": datetime.now().strftime("%H:%M:%S"), "q": text}
         t = text.strip()
+        try:                                       # 'odds SBIN' / '/mlreport': code only, never the LLM
+            import ai_odds
+            m = ai_odds._ODDS.match(t)
+            if m:
+                rec["tool"] = "odds"
+                reply, btn, info = ai_odds.card(self.ctx, m.group(1).strip())
+                rec["odds"] = info
+                if btn:
+                    rec["buttons"] = btn
+                return reply, rec
+            if ai_odds._MLREP.match(t):
+                rec["tool"] = "mlreport"
+                return ai_odds.mlreport(self.ctx), rec
+        except Exception as e:
+            rec["error"] = "odds: %s" % e
+            return "Odds lookup failed (logged): %s" % e, rec
         if t.lower() in ("help",) or t.startswith("/"):        # commands: code, never the LLM
             cmd = t.split()[0].lower().split("@")[0] if t.startswith("/") else "/help"
             rec["tool"] = cmd
@@ -192,26 +212,24 @@ class Bot:
                 txt, btn = self.flow.list(chat)[0]
                 rec["buttons"] = btn
                 return txt, rec
+            if cmd == "/stats":
+                reply, btn = self.stats_card(t.split()[1] if len(t.split()) > 1 else 1)
+                rec["buttons"] = btn
+                return reply, rec
+            if cmd == "/watch":
+                if self.watch is None:
+                    return "Market alerts are off (no store).", rec
+                import ai_watch
+                txt, btn = ai_watch.card(self.watch)
+                rec["buttons"] = btn
+                return txt, rec
             if cmd == "/check":
-                try:
-                    ar = getattr(self.flow, "router", None)
-                    am = " · alerts use %s" % ", ".join(m for m in getattr(ar, "models", []) if m not in
-                                                       getattr(ar, "dead", ())) if ar is not None else ""
-                    le = getattr(self.router, "last_error", None)
-                    dead = sorted(getattr(self.router, "dead", ()) or ())
-                    try:
-                        import ai_examples
-                        am += " · examples: " + ai_examples.status()
-                    except Exception:
-                        pass
-                    g = "\n\nGEMINI" + am + "\n" + ("✅ no errors since start" if not le else
-                                          "⚠️ last error %s · %s · %s" % (le[0], le[1], le[2]))
-                    if dead:
-                        g += "\n❌ not found (skipped): %s" % ", ".join(dead)
-                    return ai_tools.check_report(self.ctx) + g, rec
-                except Exception as e:
-                    rec["error"] = "check: %s" % e
-                    return "Data check failed: %s" % e, rec
+                full, err = self.check_full()
+                if err:
+                    rec["error"] = "check: %s" % err
+                    return full, rec
+                rec["buttons"] = [[("📊 Details", "chk:full")]]
+                return ai_tools.Rich(check_brief(full, self.ctx.now())), rec
             return "Unknown command %s — send /help (or ask in plain words)." % cmd, rec
         if len(t) > MAX_QUESTION_CHARS:
             rec["error"] = "too_long"
@@ -232,6 +250,26 @@ class Bot:
         name, args, fixes = ai_tools.fix_route(self.ctx, t, route.name, route.args, hist)
         if fixes:
             rec.update({"fixes": fixes, "tool": name})
+        if name == "explain_market" and self.agent is not None:
+            # WHY question: the LangGraph agent (parallel checks + checked AI view + alert offer).
+            # Any failure falls through to the plain tool below: facts from code, no AI view.
+            try:
+                clean = ai_tools.validate(self.ctx, name, args)
+            except ai_tools.ToolError as e:
+                rec["error"] = str(e)
+                return str(e), rec
+            try:
+                reply, buttons, info = self.agent.ask(chat, clean, t)
+                rec.update({"agent": {k: v for k, v in info.items() if k != "trace"}, "clean_args": clean,
+                            "reply_head": reply.split("\n", 1)[0][:120]})
+                if buttons:
+                    rec["buttons"] = buttons
+                self._mem.setdefault(chat, deque(maxlen=MEMORY_N)).append({
+                    "ts": time.time(), "time": datetime.now().strftime("%H:%M"), "q": t,
+                    "tool": name, "args": clean, "symbols": None, "n": None})
+                return reply, rec
+            except Exception as e:
+                rec["agent_error"] = "%s: %s" % (type(e).__name__, e)
         result, err = ai_tools.run(self.ctx, name, args, prev=hist)
         if err:
             rec["error"] = err
@@ -255,6 +293,65 @@ class Bot:
             rec["error"] = "format: %s" % e
             return "Got the data but could not format it (bug logged).", rec
 
+    def check_full(self):
+        """(full /check text, error or None). Code only."""
+        try:
+            ar = getattr(self.flow, "router", None)
+            am = " · alerts use %s" % ", ".join(m for m in getattr(ar, "models", []) if m not in
+                                               getattr(ar, "dead", ())) if ar is not None else ""
+            le = getattr(self.router, "last_error", None)
+            dead = sorted(getattr(self.router, "dead", ()) or ())
+            try:
+                import ai_examples
+                am += " · examples: " + ai_examples.status()
+            except Exception:
+                pass
+            g = "\n\nGEMINI" + am + "\n" + ("✅ no errors since start" if not le else
+                                          "⚠️ last error %s · %s · %s" % (le[0], le[1], le[2]))
+            if dead:
+                g += "\n❌ not found (skipped): %s" % ", ".join(dead)
+            try:
+                import ai_extra
+                g += "\n\nEXTRA DATA\n" + ai_extra.status_line()
+            except Exception:
+                pass
+            return ai_tools.check_report(self.ctx) + g, None
+        except Exception as e:
+            return "Data check failed: %s" % e, str(e)
+
+    def stats_card(self, days=1):
+        """(reply, buttons) for /stats: live numbers from the logs + the last eval scorecard. Code only."""
+        try:
+            import ai_stats
+            base = os.path.dirname(os.path.dirname(os.path.abspath(self.log_dir)))      # .../logs/ai_chat -> app folder
+            agent_dir = getattr(self.agent, "log_dir", None) or os.path.join(os.path.dirname(self.log_dir), "ai_agent")
+            return ai_stats.card(self.log_dir, agent_dir, os.path.join(base, "evals"), int(days))
+        except (TypeError, ValueError):
+            return "Use /stats or /stats 7 (number of days, 1 to 30).", None
+        except Exception as e:
+            return "Stats failed (logged): %s" % e, None
+
+    def explain_reply(self, chat, args, q):
+        """(reply, buttons) for one explain_market call that did not come from the router (a button).
+        The WHY agent when it is on; any failure falls back to the facts-only tool. Never raises."""
+        try:
+            clean = ai_tools.validate(self.ctx, "explain_market", args)
+        except ai_tools.ToolError as e:
+            return str(e), None
+        if self.agent is not None:
+            try:
+                reply, buttons, _info = self.agent.ask(chat, clean, q)
+                return reply, buttons
+            except Exception as e:
+                print("[AI chat] agent failed on a button (facts-only answer sent): %s" % e)
+        result, err = ai_tools.run(self.ctx, "explain_market", args)
+        if err:
+            return err, None
+        try:
+            return ai_tools.format_reply(result), None
+        except Exception as e:
+            return "Got the data but could not format it (bug logged): %s" % e, None
+
     def _reply(self, chat, text, buttons=None):
         try:
             return self.tg.send(chat, text, buttons) if buttons else self.tg.send(chat, text)
@@ -264,6 +361,70 @@ class Bot:
 
     def handle_button(self, cq):
         chat = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
+        data = str(cq.get("data") or "")
+        if chat in self.allowed and data.startswith("od:"):
+            try:
+                self.tg.answer_callback(cq.get("id"))
+            except Exception:
+                pass
+            try:
+                import ai_odds
+                text, btn = ai_odds.on_button(self.ctx, data)
+            except Exception as e:
+                text, btn = "Odds step failed (logged): %s" % e, None
+            self._log({"ts": datetime.now().strftime("%H:%M:%S"), "button": data})
+            self._reply(chat, text, btn)
+            return
+        if chat in self.allowed and data.startswith("st:"):
+            try:
+                self.tg.answer_callback(cq.get("id"))
+            except Exception:
+                pass
+            text, btn = self.stats_card(data[3:])
+            self._reply(chat, text, btn)
+            return
+        if chat in self.allowed and data.startswith(("wt:", "ww:")):
+            try:
+                self.tg.answer_callback(cq.get("id"))
+            except Exception:
+                pass
+            try:
+                if data.startswith("wt:"):                 # /watch switches
+                    import ai_watch
+                    text, btn = ai_watch.on_button(self.watch, data) if self.watch is not None else \
+                        ("Market alerts are off (no store).", None)
+                else:                                      # "Why" under a market alert -> the WHY answer
+                    _p0, kind, target = (data.split(":", 2) + ["", ""])[:3]
+                    args = {"kind": kind}
+                    if target:
+                        args["target"] = target
+                    text, btn = self.explain_reply(chat, args, "why (from a market alert)")
+            except Exception as e:
+                text, btn = "That step failed (logged): %s" % e, None
+            self._log({"ts": datetime.now().strftime("%H:%M:%S"), "button": data,
+                       "reply_head": str(text).split("\n", 1)[0][:120]})
+            self._reply(chat, text, btn)
+            return
+        if chat in self.allowed and data == "chk:full":
+            try:
+                self.tg.answer_callback(cq.get("id"))
+            except Exception:
+                pass
+            self._reply(chat, self.check_full()[0])
+            return
+        if chat in self.allowed and data.startswith("ag:") and self.agent is not None:
+            try:                                   # the WHY agent's alert offer: resume the paused run
+                self.tg.answer_callback(cq.get("id"))
+            except Exception:
+                pass
+            _p, thread, choice = (data.split(":", 2) + ["", ""])[:3]
+            try:
+                text = self.agent.resume(chat, thread, choice if choice in ("yes", "details") else "no")
+            except Exception as e:
+                text = "Alert step failed (bug logged): %s" % e
+            self._log({"ts": datetime.now().strftime("%H:%M:%S"), "button": data, "reply_head": text[:120]})
+            self._reply(chat, text)
+            return
         if chat not in self.allowed or not self.flow:
             return
         try:
@@ -305,7 +466,9 @@ class Bot:
                 for t, btn in replies:
                     self._reply(chat, t, btn)
                 return
+        t0 = time.time()
         reply, rec = self.answer(text, chat)
+        rec["ms"] = int((time.time() - t0) * 1000)             # the whole answer (model + tools + agent): /stats
         btn = rec.pop("buttons", None)
         self._log(rec)
         self._reply(chat, reply, btn)
@@ -338,6 +501,70 @@ class Bot:
             except Exception as e:
                 print("[AI chat] digest send failed: %s" % e)
         return True
+
+
+def _check_sections(full):
+    """{section: [(mark, name, rest)]} from the /check text (the same code writes both)."""
+    sec, cur = {}, "HEAD"
+    for line in full.split("\n"):
+        t = line.strip()
+        if not t:
+            continue
+        head = t.split(" (")[0].split(" ·")[0]
+        if head in ("LIVE", "HISTORY", "TOOLS", "EXTRA DATA") or t.startswith("GEMINI"):
+            cur = "GEMINI" if t.startswith("GEMINI") else head
+            continue
+        m = re.match(r"^(✅|❌|⚠️)\s*(.*)$", t)
+        if m:
+            name = re.split(r"\s{2,}| · |\s\d", m.group(2), maxsplit=1)[0].strip()
+            sec.setdefault(cur, []).append((m.group(1), name, m.group(2)))
+    return sec
+
+
+_LIVE_NAMES = {"Scan results": "scan", "Live samples": "samples", "Index samples": "indices", "OI cache": "OI",
+               "1-min bars": "bars", "PACE": "PACE", "A/D history": "breadth"}
+
+
+def check_brief(full, now):
+    """3-5 lines: WHY things are red (warming up / market closed / stalled), not a wall of ticks."""
+    sec = _check_sections(full)
+    live = sec.get("LIVE", [])
+    hm = now.hour * 60 + now.minute
+    market = now.weekday() < 5 and 9 * 60 + 15 <= hm <= 15 * 60 + 30
+    scan_ok = any(n.startswith("Scan results") and m == "✅" for m, n, _r in live)
+    bad_live = [n for m, n, _r in live if m != "✅"]
+    if not market:
+        reason = "😴 Market closed — live checks idle (normal)"
+    elif not scan_ok:
+        reason = "⏳ Warming up — first scan not done yet (normal right after start)"
+    elif bad_live:
+        reason = "⚠️ Live data missing: " + ", ".join(bad_live)
+    else:
+        reason = "✅ All live data flowing"
+    L = ["<b>🩺 %s · %s</b>" % (now.strftime("%H:%M"), reason)]
+    if live:
+        short = lambda n: next((v for k, v in _LIVE_NAMES.items() if n.startswith(k)), n.split()[0])  # noqa: E731
+        ok_ = [short(n) for m, n, _r in live if m == "✅"]
+        wait = [short(n) for m, n, _r in live if m != "✅"]
+        L.append("Live %s%s" % (("✅ " + " · ".join(ok_)) if ok_ else "",
+                                ("  %s " % ("⏳" if (not market or not scan_ok) else "❌") + " · ".join(wait)) if wait else ""))
+    hist = sec.get("HISTORY", [])
+    hb = [n for m, n, _r in hist if m != "✅"]
+    gm = sec.get("GEMINI", [])
+    ex = sec.get("EXTRA DATA", [])
+    L.append("History %s · Gemini %s · Midcap/Crude %s" % (
+        "✅" if not hb else "⚠️ " + ", ".join(hb), "✅" if all(m == "✅" for m, _n, _r in gm) else "⚠️",
+        "✅" if ex and all(m == "✅" for m, _n, _r in ex) else ("⚠️" if ex else "—")))
+    tools = sec.get("TOOLS", [])
+    ready = next((r for m, n, r in tools if m == "✅"), "")
+    failing = [r for m, n, r in tools if m == "❌"]
+    if failing:
+        L.append("Tools %s · %d wait for live data%s" % (
+            ready.split(" ")[0] + " ready" if ready else "", len(failing),
+            " (normal now)" if (not market or not scan_ok) else " ⚠️"))
+    elif ready:
+        L.append("Tools ✅ %s" % ready)
+    return "\n".join(L)
 
 
 def _loop(bot):
@@ -440,9 +667,17 @@ def _sample_loop(ctx, bot=None):
             now = datetime.now()
             hm = now.hour * 60 + now.minute
             if now.weekday() < 5 and SAMPLE_FROM <= hm <= SAMPLE_TO:
+                try:                                 # broader indices + crude (v19): own pace, never blocks
+                    import ai_extra
+                    ai_extra.poll(ctx.state)
+                except Exception as e:
+                    print("[AI chat] extra data error: %s" % e)
                 ai_tools.sample_once(ctx)
                 if bot is not None and bot.alerts is not None and hm <= ALERT_TO:
                     ai_alerts.check_alerts(ctx, bot.alerts, lambda chat, text: bot._reply(chat, text) is not False)
+                if bot is not None and bot.watch is not None and hm <= ALERT_TO:
+                    import ai_watch                  # ready-made market alerts: code only, never raises (each watch is caught)
+                    ai_watch.check(ctx, bot.watch, bot._reply, sorted(bot.allowed))
         except Exception as e:
             print("[AI chat] sampler error: %s" % e)
         time.sleep(60 - time.time() % 60 + 1)       # on the minute, +1 s after the scan writes
@@ -489,8 +724,25 @@ def start():
             ai_examples.EMBED = ai_examples.gemini_embedder(alert_router.client)
         except Exception as e:
             print("[AI chat] embeddings off (keyword-only examples): %s" % e)
+        agent = None
+        try:                                   # v19 WHY agent (LangGraph). Missing package -> facts-only answers
+            import ai_agent
+            writer = ai_llm.GeminiRouter(ai_agent.WRITE_TOOL, sectors, model=ai_llm._cfg("AI_AGENT_MODEL", alert_model),
+                                         fallback=ai_llm._cfg("AI_MODEL", ai_llm.DEFAULT_MODEL),
+                                         system=ai_agent.writer_system)
+            agent = ai_agent.MarketAgent(ctx, writer, db_dir=getattr(state, "DATA_DIR", os.path.join(base, "data")),
+                                         alerts=store, log_dir=os.path.join(base, "logs", "ai_agent"))
+        except Exception as e:
+            print("[AI chat] WHY agent off (answers stay facts-only): %s" % e)
+        watch = None
+        try:
+            import ai_watch
+            watch = ai_watch.WatchStore(os.path.join(getattr(state, "DATA_DIR", os.path.join(base, "data")),
+                                                     "ai_watch.json"))
+        except Exception as e:
+            print("[AI chat] market alerts off: %s" % e)
         bot = Bot(ctx, router, Telegram(token), chats, os.path.join(base, "logs", "ai_chat"),
-                  alerts=store, alert_router=alert_router)
+                  alerts=store, alert_router=alert_router, agent=agent, watch=watch)
         threading.Thread(target=_loop, args=(bot,), name="ai_chat", daemon=True).start()
         threading.Thread(target=_kite_fill_loop, args=(ctx,), name="ai_kite_fill", daemon=True).start()
         threading.Thread(target=_sample_loop, args=(ctx, bot), name="ai_sampler", daemon=True).start()

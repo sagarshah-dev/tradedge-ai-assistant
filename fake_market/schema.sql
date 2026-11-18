@@ -14,12 +14,16 @@ CREATE TABLE IF NOT EXISTS symbol_day (     -- one row per stock per session
 CREATE TABLE IF NOT EXISTS signals (        -- scanner signals (names only, no rules)
   day TEXT NOT NULL, t TEXT NOT NULL, sym TEXT NOT NULL,
   stage TEXT NOT NULL, side TEXT,
+  rvol REAL, pace REAL,                    -- logged AT the signal (used by odds / ML study)
+  nifty_pct REAL, sector TEXT,
+  dp15 REAL, day_pct REAL,                 -- % move in the last 15 min / on the day, at the signal
   PRIMARY KEY (day, sym, stage, t)
 );
 
 CREATE TABLE IF NOT EXISTS outcomes (       -- what happened after a signal
   day TEXT NOT NULL, sym TEXT NOT NULL, stage TEXT NOT NULL, t TEXT NOT NULL,
   side TEXT, m15 REAL, m30 REAL, m60 REAL,  -- % move after 15 / 30 / 60 min
+  mfe REAL, mae REAL,                       -- best / worst move after the signal
   res_10 TEXT,                              -- WIN | LOSS | FLAT
   src TEXT, bars_n INTEGER,                 -- bars_n = 0 means no data after the signal
   PRIMARY KEY (day, sym, stage, t)

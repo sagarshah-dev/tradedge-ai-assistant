@@ -9,7 +9,7 @@ Why: unit tests use a FAKE Gemini that answers what we expect, so they cannot ca
 real model reads a sentence (05-11: "nykaa goes below 348" came back as day % + price filter).
 Only the eval run on the real model catches that, so it gates the deploy.
 
-Needs GEMINI_EVAL_API_KEY in config.py or the environment (a key from a SEPARATE Google Cloud project, so the
+Needs GEMINI_EVAL_API_KEY in config.py (a key from a SEPARATE Google Cloud project, so the
 bot's own 500 questions/day are never used). Read-only: no Telegram message, no data change.
 """
 import argparse
@@ -57,7 +57,7 @@ def main():
     code, out = _run([py, os.path.join("evals", "run_ai_evals.py"), "--alerts"])
     pct = _pct(out)
     if code == 2 or pct is None:
-        results.append(("alert evals", False, "did not run (GEMINI_EVAL_API_KEY set?)"))
+        results.append(("alert evals", False, "did not run (GEMINI_EVAL_API_KEY set in config.py?)"))
     else:
         results.append(("alert evals", pct >= MIN_PASS, "%.0f%% (need %d%%)" % (pct, MIN_PASS)))
 
@@ -67,7 +67,7 @@ def main():
     if "re-running 0 failed" in out:
         results.append(("question evals", True, "nothing failed last time"))
     elif code == 2 or pct is None:
-        results.append(("question evals", False, "did not run (GEMINI_EVAL_API_KEY set?)"))
+        results.append(("question evals", False, "did not run (GEMINI_EVAL_API_KEY set in config.py?)"))
     else:
         need = 50 if a.quick else MIN_PASS     # quick = only hard cases: half fixed is the bar
         results.append(("question evals", pct >= need,
@@ -79,7 +79,7 @@ def main():
         print("%s %-15s %s" % ("✅" if ok else "❌", name, why))
     go = all(ok for _n, ok, _w in results)
     print("=" * 46)
-    print("GO — safe to deploy (after market hours)" if go else "NO-GO — send the FAIL lines above, do not deploy")
+    print("GO — safe to deploy after 15:30" if go else "NO-GO — send the FAIL lines above, do not deploy")
     return 0 if go else 1
 
 

@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-make_demo_media.py -- builds docs/demo.gif and docs/demo.png for the README.
+make_demo_media.py -- builds the README media: docs/demo.gif + docs/demo.png (questions and a price
+alert) and docs/demo-agent.gif + docs/demo-agent.png (WHY agent, OI build-up, odds, market watch).
 
     pip install playwright pillow && python -m playwright install chromium
-    python tools/make_demo_media.py
+    python make_demo_media.py          (CHROME_PATH=/path/to/chrome to use an installed browser)
 
 Nothing here is drawn by hand: it runs the real offline tour (demo.run_tour -> the same
 ai_chat.Bot / ai_alerts / ai_tools code as the Telegram bot, on fake_market), records
@@ -15,15 +16,23 @@ import io
 import os
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 import demo                                    # noqa: E402
 
+import ai_tools                                 # noqa: E402
+
 STEPS = [("q", "what is low of nykaa"), ("q", "stocks where open = high"),
          ("q", "top 3 sectors right now"), ("q", "should I buy TATAMOTORS"),
          ("q", "alert me when nykaa goes below 348"), ("btn", 1), ("tick", 8)]
+
+# v19-v21: the LangGraph WHY agent (and its alert offer = human-in-the-loop), fresh OI build-up,
+# signal odds (code only), and a ready-made market watch whose "Why" button runs the agent.
+AGENT_STEPS = [("q", "why are psu banks firing today"), ("btn", 2),
+               ("q", "which stocks showed fresh OI buildup today"),
+               ("q", "odds SBIN"), ("btn", 2),
+               ("tick", 3), ("btn", 1)]
 
 WIDTH, HEIGHT = 560, 860
 
@@ -41,6 +50,7 @@ body{background:#ffffff;font-family:Inter,system-ui,sans-serif}
 .b{align-self:flex-start;background:#fff;border-bottom-left-radius:4px}
 .b pre{font-family:"DejaVu Sans Mono",monospace;font-size:11px;line-height:1.38;white-space:pre-wrap;
        word-break:break-word;color:#1b1b1b}
+.b .rich{font-size:12.5px;line-height:1.42;white-space:pre-wrap;word-break:break-word;color:#1b1b1b}
 .btns{display:flex;gap:6px;margin-top:5px;align-self:flex-start;width:min(92%%,330px)}
 .btns span{flex:1;text-align:center;background:rgba(48,74,94,.55);color:#fff;font-size:13px;font-weight:500;
            padding:8px 6px;border-radius:9px}
@@ -57,7 +67,13 @@ def _items(log):
         if e[0] == "user":
             out.append('<div class="m u">%s</div>' % html.escape(e[1]))
         elif e[0] == "bot":
-            out.append('<div class="m b"><pre>%s</pre></div>' % html.escape(e[1]))
+            if isinstance(e[1], ai_tools.Rich):          # Telegram HTML mode: only <b> and <i> are kept
+                body = html.escape(str(e[1]))
+                for tag in ("b", "i"):
+                    body = body.replace("&lt;%s&gt;" % tag, "<%s>" % tag).replace("&lt;/%s&gt;" % tag, "</%s>" % tag)
+                out.append('<div class="m b"><div class="rich">%s</div></div>' % body)
+            else:
+                out.append('<div class="m b"><pre>%s</pre></div>' % html.escape(e[1]))
             if e[2]:
                 out.append('<div class="btns">%s</div>' % "".join("<span>%s</span>" % html.escape(b) for b in e[2]))
         elif e[0] == "press":
@@ -87,17 +103,17 @@ def _page(items, upto):
     return "<!doctype html><meta charset=utf-8><style>%s</style>%s" % (CSS % (WIDTH, HEIGHT), body)
 
 
-def main():
+def render(steps, name):
     from PIL import Image
     from playwright.sync_api import sync_playwright
     log = []
-    demo.run_tour(STEPS, log=log, quiet=True)
+    demo.run_tour(steps, log=log, quiet=True)
     items = _items(log)
     out = os.path.join(ROOT, "docs")
     os.makedirs(out, exist_ok=True)
     frames, durations = [], []
     with sync_playwright() as p:
-        br = p.chromium.launch()
+        br = p.chromium.launch(executable_path=os.environ.get("CHROME_PATH") or None)
         pg = br.new_page(viewport={"width": WIDTH, "height": HEIGHT}, device_scale_factor=1.5)   # sharp text, GIF < 1.5 MB
         for i in range(1, len(items) + 1):
             it = items[i - 1]
@@ -110,16 +126,21 @@ def main():
             text = it if isinstance(it, str) else ""
             durations.append(900 if 'class="m u"' in text or isinstance(it, tuple) else
                              1200 if 'class="sys"' in text else min(4200, 1600 + 9 * len(text) // 10))
-        durations[-1] = 4500                             # hold the alert ping
+        durations[-1] = 4500                             # hold the last message
         hi = br.new_page(viewport={"width": WIDTH, "height": HEIGHT}, device_scale_factor=2)
         hi.set_content(_page(items, len(items)))
-        hi.screenshot(path=os.path.join(out, "demo.png"))
+        hi.screenshot(path=os.path.join(out, name + ".png"))
         br.close()
     pal = [f.quantize(colors=128, method=Image.Quantize.MEDIANCUT) for f in frames]
-    pal[0].save(os.path.join(out, "demo.gif"), save_all=True, append_images=pal[1:], duration=durations,
+    pal[0].save(os.path.join(out, name + ".gif"), save_all=True, append_images=pal[1:], duration=durations,
                 loop=0, optimize=True)
-    print("docs/demo.gif (%d frames, %.0f KB) · docs/demo.png" % (
-        len(frames), os.path.getsize(os.path.join(out, "demo.gif")) / 1024))
+    print("docs/%s.gif (%d frames, %.0f KB) · docs/%s.png" % (
+        name, len(frames), os.path.getsize(os.path.join(out, name + ".gif")) / 1024, name))
+
+
+def main():
+    render(STEPS, "demo")
+    render(AGENT_STEPS, "demo-agent")
 
 
 if __name__ == "__main__":

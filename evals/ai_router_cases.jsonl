@@ -173,3 +173,37 @@
 {"q": "vix now", "tool": "live_value", "args": {"symbols": ["IDX:INDIA VIX"]}}
 {"q": "when did nykaa make today's low", "tool": "live_value", "args": {"symbols": ["NYKAA"], "fields": ["low"]}}
 {"q": "how is nykaa doing", "tool": "live_symbol", "args": {"symbol": "NYKAA"}}
+{"q": "which stocks showed fresh OI buildup today", "tool": "oi_buildup", "args": {"kind": "buildup", "fresh_only": true}, "v": 19}
+{"q": "fresh long build-up last 30 min", "tool": "oi_buildup", "args": {"kind": "long_buildup", "fresh_only": true, "window_min": 30}, "v": 19}
+{"q": "long buildup in last 15 min", "tool": "oi_buildup", "args": {"kind": "long_buildup", "window_min": 15}, "v": 19}
+{"q": "short build up stocks in bank", "tool": "oi_buildup", "args": {"kind": "short_buildup", "sector": "NIFTY BANK"}, "v": 19}
+{"q": "short covering right now", "tool": "oi_buildup", "args": {"kind": "short_covering"}, "v": 19}
+{"q": "long unwinding stocks last hour", "tool": "oi_buildup", "args": {"kind": "long_unwinding", "window_min": 60}, "v": 19}
+{"q": "aaje OI build up kya che metal ma", "tool": "oi_buildup", "args": {"kind": "buildup", "sector": "NIFTY METAL"}, "v": 19}
+{"q": "short breaking stocks", "tool": "live_screen", "args": {"conditions": [{"left": "short_state", "op": "contains", "text": "BREAKING"}]}, "v": 19}
+{"q": "show breaking stocks with rvol above 2", "tool": "live_screen", "args": {"conditions": [{"left": "state", "op": "contains", "text": "BREAKING"}, {"left": "rvol", "op": ">", "value": 2}]}, "v": 19}
+{"q": "SUPER tier stocks now", "tool": "live_screen", "args": {"conditions": [{"left": "tier", "op": "is", "text": "SUPER"}]}, "v": 19}
+{"q": "stocks in primed state above vwap", "tool": "live_screen", "args": {"conditions": [{"left": "state", "op": "contains", "text": "PRIMED"}, {"left": "price", "op": ">", "right": "vwap"}]}, "v": 19}
+{"q": "midcap now", "tool": "live_value", "args": {"symbols": ["IDX:NIFTY MIDCAP 150"]}, "v": 19}
+{"q": "crude price", "tool": "live_value", "args": {"symbols": ["IDX:CRUDEOIL"]}, "v": 19}
+{"q": "why is nifty down", "tool": "explain_market", "args": {"kind": "index_move", "target": "NIFTY 50", "direction": "down"}, "v": 19}
+{"q": "why is market falling today", "tool": "explain_market", "args": {"kind": "index_move", "direction": "down"}, "v": 19}
+{"q": "why banknifty up", "tool": "explain_market", "args": {"kind": "index_move", "target": "NIFTY BANK", "direction": "up"}, "v": 19}
+{"q": "why midcap up but nifty down", "tool": "explain_market", "args": {"kind": "index_move", "target": "NIFTY MIDCAP 150", "compare": "NIFTY 50"}, "v": 19}
+{"q": "why are psu banks firing today", "tool": "explain_market", "args": {"kind": "sector_move", "target": "NIFTY PSU BK", "direction": "up"}, "v": 19}
+{"q": "why IT sector falling", "tool": "explain_market", "args": {"kind": "sector_move", "target": "NIFTY IT", "direction": "down"}, "v": 19}
+{"q": "which sector is strongest now and why", "tool": "explain_market", "args": {"kind": "strongest_sectors"}, "v": 19}
+{"q": "weakest sector right now with reasons", "tool": "explain_market", "args": {"kind": "strongest_sectors", "direction": "down"}, "v": 19}
+{"q": "which sector is picking up in last 30 min with oi and volume", "tool": "explain_market", "args": {"kind": "rotation", "window_min": 30}, "v": 19}
+{"q": "day leader vs new leader", "tool": "explain_market", "args": {"kind": "rotation"}, "v": 19}
+{"q": "why is SBIN moving", "tool": "explain_market", "args": {"kind": "stock_move", "target": "SBIN"}, "v": 19}
+{"q": "why vix up today", "tool": "explain_market", "args": {"kind": "vix", "direction": "up"}, "v": 19}
+{"q": "crude effect on market", "tool": "explain_market", "args": {"kind": "crude"}, "v": 19}
+{"q": "top 5 sectors today", "tool": "live_sector_rank", "args": {"metric": "price", "limit": 5}, "v": 19}
+{"q": "nifty oi data", "tool": "live_value", "args": {"symbols": ["IDX:NIFTY 50"]}, "v": 20, "live": "11-11: oi — (not for an index)"}
+{"q": "nifty future oi", "tool": "live_value", "args": {"symbols": ["IDX:NIFTY 50"]}, "v": 20, "live": "11-11: Unknown index NIFTY_FUT"}
+{"q": "banknifty futures oi now", "tool": "live_value", "args": {"symbols": ["IDX:NIFTY BANK"]}, "v": 20}
+{"q": "fmcg sector", "tool": "explain_market", "args": {"kind": "sector_move", "target": "NIFTY FMCG"}, "v": 20, "live": "11-11: listed all 14 sectors"}
+{"q": "psu bank", "tool": "explain_market", "args": {"kind": "sector_move", "target": "NIFTY PSU BK"}, "v": 20}
+{"q": "why nifty down", "tool": "explain_market", "args": {"kind": "index_move", "target": "NIFTY 50"}, "v": 20, "live": "11-11: asked while NIFTY was up"}
+{"q": "is nifty fading from high", "tool": "explain_market", "args": {"kind": "index_move", "target": "NIFTY 50"}, "v": 20}

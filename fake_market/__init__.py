@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-fake_market -- a made-up NSE session so the AI layer runs without the trading app.
+fake_market -- a made-up NSE session (TEST FIXTURE, same file as the public demo repo).
 
 The private app fills these in-memory caches from Kite / yfinance and its own scanner.
 Here every number is generated from a seeded random walk, so runs are repeatable.
@@ -54,6 +54,8 @@ DRIFT = {"NYKAA": -0.017, "TATASTEEL": 0.012, "SBIN": 0.008, "INFY": -0.006, "BA
          "ITC": 0.002, "MARUTI": -0.003, "HINDALCO": 0.007}
 # After START: NYKAA slides ~0.1% a minute, so "alert me when nykaa goes below 348" fires in the demo.
 DRIFT_LIVE = {"NYKAA": -0.10}
+# SBIN: futures OI flat all morning, then a FRESH long build-up from 11:00 (for 'fresh OI build-up').
+FRESH_OI_FROM = {"SBIN": (11, 0)}
 OPEN_IS_HIGH = {"WIPRO"}              # opens at the day high and slides: an "open = high" stock
 OPEN_IS_LOW = {"PNB"}                 # opens at the day low and climbs: an "open = low" stock
 
@@ -160,6 +162,7 @@ class Market:
                           " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                           (d, s, st, t, side, m60 / 3, m60 / 2, m60, "WIN" if m60 > 0.5 else "LOSS" if m60 < -0.5
                            else "FLAT", "minute", 60))
+        self._odds_history(c)
         c.commit()
         c.close()
         c = sqlite3.connect(self.playbook_db)
@@ -174,10 +177,36 @@ class Market:
         c.commit()
         c.close()
 
+    def _odds_history(self, c):
+        """Past SANKET / SAGA / SHARK signals for 'odds' and the ML study. Own RNG, so the rest of
+        the session is unchanged. Outcomes are coin flips: there is NO edge in this data."""
+        r = random.Random(4242)
+        for d in _weekdays_before(TODAY, 90):          # ~4 months, so look-alikes exist after a loosen
+            for s in r.sample(FNO_SYMBOLS, 10):
+                st, side = r.choice(("SANKET", "SAGA", "SHARK")), r.choice(["LONG", "SHORT"])
+                t = "%02d:%02d:00" % (r.choice([9, 10, 11, 13, 14]), r.randint(16, 59))
+                rv, pc = round(r.uniform(0.8, 4.0), 2), round(r.uniform(0.2, 1.6), 2)
+                m60 = r.gauss(0.05, 0.8)
+                c.execute("INSERT OR IGNORE INTO signals(day,t,sym,stage,side,rvol,pace,nifty_pct,sector,dp15,day_pct)"
+                          " VALUES(?,?,?,?,?,?,?,?,?,?,?)", (d, t, s, st, side, rv, pc, round(r.uniform(-1, 1), 2),
+                                                             SECTOR_MAP[s], round(r.gauss(0, 0.4), 2),
+                                                             round(r.gauss(0, 1.2), 2)))
+                c.execute("INSERT OR IGNORE INTO outcomes(day,sym,stage,t,side,m15,m30,m60,mfe,mae,res_10,src,bars_n)"
+                          " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          (d, s, st, t, side, m60 / 3, m60 / 2, m60, abs(m60) + 0.3, -abs(r.gauss(0, 0.4)),
+                           "WIN" if m60 > 0.5 else "LOSS" if m60 < -0.5 else "FLAT", "minute", 60))
+        # today: SBIN logs a SANKET LONG at 11:05, so 'odds SBIN' has a signal to look up
+        c.execute("INSERT OR IGNORE INTO signals(day,t,sym,stage,side,rvol,pace,nifty_pct,sector,dp15,day_pct)"
+                  " VALUES(?,?,?,?,?,?,?,?,?,?,?)", (TODAY, "11:05:00", "SBIN", "SANKET", "LONG", 2.4, 0.9, 0.1,
+                                                     SECTOR_MAP["SBIN"], 0.3, 0.8))
+
     # ── today's live caches (the shapes the private app keeps in state.py) ───
     def _state(self):
         s = types.SimpleNamespace()
         s.FNO_SYMBOLS, s.SECTOR_MAP = list(FNO_SYMBOLS), dict(SECTOR_MAP)
+        # like the live state.py: only these two indices get an above_vwap flag that means something
+        # (futures price vs futures VWAP). No other index has a real VWAP.
+        s.SECTOR_IDX_VWAP_FUT_NAME = {"NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY"}
         s.BASE_DIR = s.DATA_DIR = os.path.join(self.dir, "data")
         s.DAILY_OHLC_CSV = os.path.join(self.dir, "data", "daily_ohlc.csv")
         for name in _LOCKS:
@@ -261,6 +290,10 @@ class Market:
             with st.SESSION_HILO_LOCK:
                 st.SESSION_HILO[sym] = {"hi": hi * 1.0005, "lo": lo * 0.9995}
             oi_open = round(pct * 1.5 + r.gauss(0, 0.3), 2)
+            if sym in FRESH_OI_FROM:
+                h0, m0 = FRESH_OI_FROM[sym]
+                mins = (t.hour * 60 + t.minute) - (h0 * 60 + m0)
+                oi_open = 0.0 if mins < 0 else round(0.06 * mins, 2)
             st.OI_CACHE[sym] = {"oi_from_open": oi_open, "oi_session": oi_open, "oi_15m": round(r.gauss(0, 0.6), 2),
                                 "streak": abs(int(pct * 2)) % 6, "vol_quad": "LBUILD" if pct > 0 else "SBUILD",
                                 "iv_dir": "rising" if pct < 0 else "flat"}

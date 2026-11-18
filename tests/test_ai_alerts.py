@@ -493,7 +493,7 @@ def test_price_without_number_asks_which_price_with_cancel(ctx, store):
     assert "Watch: NYKAA price ≤ 348" in t
 
 
-# ── v14: PACE value change (user: 1.25 since morning -> 1.27 = notify) ───────────────
+# ── v14: PACE value change (the user: 1.25 since morning -> 1.27 = notify) ───────────────
 @pytest.fixture(autouse=True)
 def _fresh_members(monkeypatch):
     monkeypatch.setattr(A, "_MEMBERS", {})
@@ -659,7 +659,7 @@ def test_pace_change_is_tagged_low_or_high_break(ctx):
 
 
 def test_alert_pace_low_break_with_volume_support(ctx, store):
-    """user 05-11 15:14: 'pace changes but only when low breaks with volume support'."""
+    """the user 05-11 15:14: 'pace changes but only when low breaks with volume support'."""
     _fut_ticks(ctx, {"AAA": 3.0, "BBB": 0.5})
     f = _flow(ctx, store, {"low breaks": ("create_alert", {"target": "stocks", "metric": "pace_change"})})
     (t, _), = f.on_text(CHAT, "alert me when pace changes but only when low breaks with volume support")
@@ -763,7 +763,7 @@ def test_screen_refuses_unknown_fields(ctx):
 
 
 def test_alert_open_equals_high_and_down_half_percent(ctx, store):
-    """user 06-11 09:12: 'alert me when stock open=high and decrease 0.5% after open'."""
+    """the user 06-11 09:12: 'alert me when stock open=high and decrease 0.5% after open'."""
     _oh_market(ctx)
     conds = [{"left": "open", "op": "=", "right": "high"}, {"left": "price", "op": "<=", "right": "open", "pct": -0.5}]
     f = _flow(ctx, store, {"open=high": ("create_alert", {"target": "stocks", "metric": "screen", "conditions": conds})})
