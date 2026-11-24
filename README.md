@@ -27,6 +27,46 @@ Alerts are parsed by the model once, confirmed by the user, then checked every m
 by hand. Offline, the agent's one 🧠 line comes from a stand-in writer that reuses the code's labels; with a
 <code>GEMINI_API_KEY</code> Gemini writes it and the same verifier checks it.</sub></p>
 
+## The system behind it: TradEdge SAGA (private code)
+
+This assistant is one layer of **TradEdge SAGA**, a real-time intraday dashboard for NSE F&O that I built
+and used during live market hours. The trading app's code and strategy stay private; this is how it works.
+
+- **Live data for 213 F&O symbols from Zerodha Kite.** Futures ticks come over the KiteTicker WebSocket.
+  Equity 1-minute bars are built in code from Kite quote polling every ~1.2 s, because the quote API gives
+  one snapshot, not per-minute bars. Option chains and OI come from Kite REST in a ~170 s pass.
+  yfinance supplies daily history and is the fallback if the poller goes silent.
+- **15 long-running background threads,** each with one job and its own cadence: the tick stream, the bar
+  poller, the OI fetch, the scanner, PACE, sector intel, the watchlist watcher and end-of-day jobs.
+  Each shared cache has one writer and its own lock.
+- **A single-page dashboard** in Flask + Flask-SocketIO (threading mode): one shell page with tabs
+  (Home, Signals, Super, **OI Radar**, IV Lab, Watchlist, Alerts), one browser socket, ~70 Flask routes.
+- **Storage:** three SQLite databases split by concern (signals, IV tracking, the trade playbook),
+  plus JSONL logs for the raw scan passes.
+
+```mermaid
+flowchart LR
+  KT["KiteTicker WebSocket<br/>futures ticks"] --> TC["live tick cache"]
+  KQ["Kite quote polling<br/>~1.2 s"] --> BARS["own 1-min bars"]
+  KR["Kite REST<br/>option chains + OI"] --> OI["OI fetch thread<br/>OI cache + history"]
+  TC --> SCAN["scanner + PACE threads<br/>213 symbols"]
+  BARS --> SCAN
+  OI --> SCAN
+  SCAN --> UI["Flask-SocketIO<br/>single-page dashboard"]
+  SCAN --> DB[("3 SQLite DBs<br/>+ JSONL logs")]
+  SCAN --> TG["Telegram alerts"]
+  OI --> AI["this repo:<br/>AI assistant (read-only)"]
+  SCAN --> AI
+```
+
+**Three production bugs I found and fixed in it**
+
+| Bug | Root cause | Fix |
+| --- | --- | --- |
+| A stock showed as a strong live signal on a price that wasn't real | One line, `futures_ltp or eq_ltp`, silently used the spot price when the futures price was missing | Two separate price tracks with no fallback between them: a missing price means no signal, never a guessed one |
+| The scan loop went silent for **2 min 35 s** between passes | A synchronous SQLite write inside the loop; on Windows, a slow disk flush blocked the whole 213-symbol pass | Found it with per-phase timing logs; moved the write to a fire-and-forget background thread |
+| Lock contention slowed every pass | The scan took the shared-cache lock once per symbol, **213 times per pass** | Took the lock once around the loop: **213 → 1** per pass |
+
 ## What it can do
 
 | Use case | Example | How it works |
